@@ -111,7 +111,7 @@ export default function App() {
   const [lineHeight, setLineHeight] = useState(clampLineHeight(parseFloat(String(initialSettings.lineHeight || 1.35))));
   const [showChrome, setShowChrome] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [highlightMenu, setHighlightMenu] = useState({ visible: false, x: 0, y: 0, start: 0, end: 0 });
+  const [highlightMenu, setHighlightMenu] = useState({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
   const [supabaseUrlInput, setSupabaseUrlInput] = useState(initialSettings.supabaseUrl || "");
   const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(initialSettings.supabaseAnonKey || "");
   const [settingsStatus, setSettingsStatus] = useState(initialSettings.lastSyncMessage || "");
@@ -217,7 +217,7 @@ export default function App() {
   useEffect(() => {
     const handlePointerDown = (event) => {
       if (event.target.closest(".highlight-menu")) return;
-      setHighlightMenu((current) => (current.visible ? { visible: false, x: 0, y: 0, start: 0, end: 0 } : current));
+      setHighlightMenu((current) => (current.visible ? { visible: false, x: 0, y: 0, start: 0, end: 0, content: "" } : current));
     };
 
     document.addEventListener("pointerdown", handlePointerDown);
@@ -267,6 +267,17 @@ export default function App() {
       current.map((novel) => {
         if (novel.id !== id) return novel;
         return updater(novel);
+      })
+    );
+  }
+
+  function commitLibraryState(nextNovels, nextActiveNovelId = activeNovelId) {
+    setNovels(nextNovels);
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        novels: nextNovels,
+        activeNovelId: nextActiveNovelId
       })
     );
   }
@@ -407,12 +418,12 @@ export default function App() {
 
   function ensureActiveNovel() {
     if (activeNovel) return activeNovel;
-      const novel = createNovel((titleInput || "").trim() || `Novel ${novels.length + 1}`);
-      novel.fontSize = fontSize;
-      novel.lineHeight = lineHeight;
-      setNovels((current) => [...current, novel]);
-      setActiveNovelId(novel.id);
-      return novel;
+    const novel = createNovel((titleInput || "").trim() || `Novel ${novels.length + 1}`);
+    novel.fontSize = fontSize;
+    novel.lineHeight = lineHeight;
+    setNovels((current) => [...current, novel]);
+    setActiveNovelId(novel.id);
+    return novel;
   }
 
   function handleOpenNovel(id) {
@@ -420,14 +431,14 @@ export default function App() {
     setActiveNovelId(id);
     setViewMode("reader");
     setShowChrome(false);
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
   }
 
   function handleBackToLibrary() {
     flushPendingSaves();
     setViewMode("library");
     setShowChrome(false);
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
   }
 
   function handleNewNovel() {
@@ -440,7 +451,7 @@ export default function App() {
     }
     previousRenderedNovelIdRef.current = null;
     setViewMode("library");
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
     updatePageMetrics();
   }
 
@@ -480,10 +491,9 @@ export default function App() {
   function handleReaderInput() {
     const novel = ensureActiveNovel();
     if (!novel) return;
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
     updateNovelById(novel.id, (current) => ({
       ...current,
-      highlight: null,
       updatedAt: Date.now()
     }));
     queueSave();
@@ -529,15 +539,8 @@ export default function App() {
           }
         : entry
     );
-    setNovels(nextNovels);
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        novels: nextNovels,
-        activeNovelId: novel.id
-      })
-    );
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
+    commitLibraryState(nextNovels, novel.id);
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
     queueAutoSync();
   }
 
@@ -855,7 +858,7 @@ export default function App() {
           onContextMenu={(event) => {
             const range = getSelectionHighlightRange();
             if (!range) {
-              setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
+              setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
               return;
             }
             event.preventDefault();
