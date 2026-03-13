@@ -77,6 +77,7 @@ function clampLineHeight(value) {
 }
 
 function createNovel(title) {
+  const settings = loadAppSettings();
   const now = Date.now();
   return {
     id: `novel-${now}-${Math.random().toString(36).slice(2, 8)}`,
@@ -84,6 +85,8 @@ function createNovel(title) {
     content: "",
     scrollTop: 0,
     highlight: null,
+    fontSize: clampFontSize(parseInt(String(settings.fontSize || 17), 10)),
+    lineHeight: clampLineHeight(parseFloat(String(settings.lineHeight || 1.35))),
     updatedAt: now
   };
 }
@@ -162,6 +165,12 @@ export default function App() {
       setTitleInput("");
     }
   }, [activeNovel, viewMode]);
+
+  useEffect(() => {
+    if (!activeNovel) return;
+    setFontSize(clampFontSize(parseInt(String(activeNovel.fontSize || 17), 10)));
+    setLineHeight(clampLineHeight(parseFloat(String(activeNovel.lineHeight || 1.35))));
+  }, [activeNovel?.id, activeNovel?.fontSize, activeNovel?.lineHeight]);
 
   useEffect(() => {
     const reader = readerRef.current;
@@ -249,6 +258,32 @@ export default function App() {
     );
   }
 
+  function applyFontSize(nextValue) {
+    const next = clampFontSize(nextValue);
+    setFontSize(next);
+    if (activeNovel) {
+      updateNovelById(activeNovel.id, (novel) => ({
+        ...novel,
+        fontSize: next,
+        updatedAt: Date.now()
+      }));
+      queueAutoSync();
+    }
+  }
+
+  function applyLineHeight(nextValue) {
+    const next = clampLineHeight(nextValue);
+    setLineHeight(next);
+    if (activeNovel) {
+      updateNovelById(activeNovel.id, (novel) => ({
+        ...novel,
+        lineHeight: next,
+        updatedAt: Date.now()
+      }));
+      queueAutoSync();
+    }
+  }
+
   function queueAutoSync() {
     const config = getSyncConfig();
     if (!config.isConfigured || syncingSuppressedRef.current) return;
@@ -281,6 +316,8 @@ export default function App() {
             title: (titleInput || novel.title || "Untitled Novel").trim(),
             content,
             scrollTop: readerRef.current.scrollTop,
+            fontSize,
+            lineHeight,
             updatedAt: now
           }
         : novel
@@ -333,10 +370,12 @@ export default function App() {
 
   function ensureActiveNovel() {
     if (activeNovel) return activeNovel;
-    const novel = createNovel((titleInput || "").trim() || `Novel ${novels.length + 1}`);
-    setNovels((current) => [...current, novel]);
-    setActiveNovelId(novel.id);
-    return novel;
+      const novel = createNovel((titleInput || "").trim() || `Novel ${novels.length + 1}`);
+      novel.fontSize = fontSize;
+      novel.lineHeight = lineHeight;
+      setNovels((current) => [...current, novel]);
+      setActiveNovelId(novel.id);
+      return novel;
   }
 
   function handleOpenNovel(id) {
@@ -370,6 +409,8 @@ export default function App() {
     if (!activeNovel) {
       const novel = createNovel(title);
       novel.content = normalizeText(readerRef.current?.innerText || "");
+      novel.fontSize = fontSize;
+      novel.lineHeight = lineHeight;
       setNovels((current) => [...current, novel]);
       setActiveNovelId(novel.id);
       queueAutoSync();
@@ -447,12 +488,26 @@ export default function App() {
       end: before.length + middle.length
     };
 
-    setNovels((current) =>
-      current.map((entry) =>
-        entry.id === novel.id
-          ? { ...entry, content, highlight: nextHighlight, scrollTop: reader.scrollTop, updatedAt: Date.now() }
-          : entry
-      )
+    const nextNovels = novels.map((entry) =>
+      entry.id === novel.id
+        ? {
+            ...entry,
+            content,
+            highlight: nextHighlight,
+            scrollTop: reader.scrollTop,
+            fontSize,
+            lineHeight,
+            updatedAt: Date.now()
+          }
+        : entry
+    );
+    setNovels(nextNovels);
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify({
+        novels: nextNovels,
+        activeNovelId: novel.id
+      })
     );
     queueAutoSync();
   }
@@ -474,8 +529,8 @@ export default function App() {
       scroll_top: Math.max(0, Math.floor(novel.scrollTop || 0)),
       highlight_start: novel.highlight?.start ?? null,
       highlight_end: novel.highlight?.end ?? null,
-      font_size: fontSize,
-      line_height: lineHeight,
+      font_size: clampFontSize(parseInt(String(novel.fontSize || 17), 10)),
+      line_height: clampLineHeight(parseFloat(String(novel.lineHeight || 1.35))),
       is_active: novel.id === activeNovelId,
       client_updated_at: new Date(novel.updatedAt || Date.now()).toISOString()
     };
@@ -500,6 +555,8 @@ export default function App() {
             row.highlight_start == null || row.highlight_end == null
               ? null
               : { start: row.highlight_start, end: row.highlight_end },
+          fontSize: clampFontSize(parseInt(String(row.font_size || 17), 10)),
+          lineHeight: clampLineHeight(parseFloat(String(row.line_height || 1.35))),
           updatedAt: remoteTime || Date.now()
         });
 
@@ -712,7 +769,7 @@ export default function App() {
 
           <div className="controls" aria-label="Reader controls">
             <div className="control-group" aria-label="Font size controls">
-              <button type="button" aria-label="Decrease text size" onClick={() => setFontSize((value) => clampFontSize(value - FONT_STEP))}>
+              <button type="button" aria-label="Decrease text size" onClick={() => applyFontSize(fontSize - FONT_STEP)}>
                 -
               </button>
               <input
@@ -722,10 +779,10 @@ export default function App() {
                 step="1"
                 value={fontSize}
                 aria-label="Text size in pixels"
-                onChange={(event) => setFontSize(clampFontSize(parseInt(event.target.value, 10)))}
+                onChange={(event) => applyFontSize(parseInt(event.target.value, 10))}
               />
               <span>px</span>
-              <button type="button" aria-label="Increase text size" onClick={() => setFontSize((value) => clampFontSize(value + FONT_STEP))}>
+              <button type="button" aria-label="Increase text size" onClick={() => applyFontSize(fontSize + FONT_STEP)}>
                 +
               </button>
             </div>
@@ -733,7 +790,7 @@ export default function App() {
               <button
                 type="button"
                 aria-label="Decrease line spacing"
-                onClick={() => setLineHeight((value) => clampLineHeight(value - LINE_HEIGHT_STEP))}
+                onClick={() => applyLineHeight(lineHeight - LINE_HEIGHT_STEP)}
               >
                 -
               </button>
@@ -744,13 +801,13 @@ export default function App() {
                 step="0.01"
                 value={lineHeight}
                 aria-label="Line spacing value"
-                onChange={(event) => setLineHeight(clampLineHeight(parseFloat(event.target.value)))}
+                onChange={(event) => applyLineHeight(parseFloat(event.target.value))}
               />
               <span>lh</span>
               <button
                 type="button"
                 aria-label="Increase line spacing"
-                onClick={() => setLineHeight((value) => clampLineHeight(value + LINE_HEIGHT_STEP))}
+                onClick={() => applyLineHeight(lineHeight + LINE_HEIGHT_STEP)}
               >
                 +
               </button>

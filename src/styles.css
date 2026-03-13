@@ -323,6 +323,12 @@ input {
 
 .app-shell.library-mode .reader {
   padding-left: 348px;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+.app-shell.library-mode .reader::before {
+  content: none;
 }
 
 .reader * {
@@ -366,17 +372,11 @@ input {
   padding: 8px 12px;
   border-radius: 999px;
   font-size: 13px;
-  opacity: 0;
-  transform: translateY(8px);
-  pointer-events: none;
-  transition:
-    opacity 140ms ease,
-    transform 140ms ease;
+  opacity: 1;
 }
 
-.reader-pane.show-chrome .page-counter {
-  opacity: 1;
-  transform: translateY(0);
+.app-shell.library-mode .page-counter {
+  display: none;
 }
 
 .settings-overlay {
