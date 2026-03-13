@@ -111,6 +111,7 @@ export default function App() {
   const [lineHeight, setLineHeight] = useState(clampLineHeight(parseFloat(String(initialSettings.lineHeight || 1.35))));
   const [showChrome, setShowChrome] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [highlightMenu, setHighlightMenu] = useState({ visible: false, x: 0, y: 0, start: 0, end: 0 });
   const [supabaseUrlInput, setSupabaseUrlInput] = useState(initialSettings.supabaseUrl || "");
   const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(initialSettings.supabaseAnonKey || "");
   const [settingsStatus, setSettingsStatus] = useState(initialSettings.lastSyncMessage || "");
@@ -214,6 +215,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const handlePointerDown = (event) => {
+      if (event.target.closest(".highlight-menu")) return;
+      setHighlightMenu((current) => (current.visible ? { visible: false, x: 0, y: 0, start: 0, end: 0 } : current));
+    };
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+    };
+  }, []);
+
+  useEffect(() => {
     setViewMode("library");
     if (getSyncConfig().isConfigured) {
       void syncWithSupabase();
@@ -256,6 +269,30 @@ export default function App() {
         return updater(novel);
       })
     );
+  }
+
+  function getSelectionHighlightRange() {
+    const reader = readerRef.current;
+    const selection = window.getSelection();
+    if (!reader || !selection || selection.rangeCount === 0) return null;
+    const range = selection.getRangeAt(0);
+    if (!reader.contains(range.commonAncestorContainer)) return null;
+    const selectedText = selection.toString();
+    if (!selectedText.trim()) return null;
+
+    const start = getTextOffset(reader, range.startContainer, range.startOffset);
+    const end = getTextOffset(reader, range.endContainer, range.endOffset);
+    if (end <= start) return null;
+
+    const content = normalizeText(reader.innerText || "");
+    const middle = content.slice(start, end);
+    if (!middle.trim()) return null;
+
+    return {
+      start,
+      end,
+      content
+    };
   }
 
   function applyFontSize(nextValue) {
@@ -383,12 +420,14 @@ export default function App() {
     setActiveNovelId(id);
     setViewMode("reader");
     setShowChrome(false);
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
   }
 
   function handleBackToLibrary() {
     flushPendingSaves();
     setViewMode("library");
     setShowChrome(false);
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
   }
 
   function handleNewNovel() {
@@ -401,6 +440,7 @@ export default function App() {
     }
     previousRenderedNovelIdRef.current = null;
     setViewMode("library");
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
     updatePageMetrics();
   }
 
@@ -440,6 +480,7 @@ export default function App() {
   function handleReaderInput() {
     const novel = ensureActiveNovel();
     if (!novel) return;
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
     updateNovelById(novel.id, (current) => ({
       ...current,
       highlight: null,
@@ -465,34 +506,21 @@ export default function App() {
     handleReaderInput();
   }
 
-  function handleReaderDoubleClick() {
+  function applyHighlightFromMenu() {
     const reader = readerRef.current;
-    const selection = window.getSelection();
     const novel = ensureActiveNovel();
-    if (!reader || !selection || selection.rangeCount === 0 || !novel) return;
-    const range = selection.getRangeAt(0);
-    if (!reader.contains(range.commonAncestorContainer)) return;
-
-    const text = selection.toString().trim();
-    if (!text) return;
-
-    const start = getTextOffset(reader, range.startContainer, range.startOffset);
-    const end = getTextOffset(reader, range.endContainer, range.endOffset);
-    const content = normalizeText(reader.innerText || "");
-    const before = content.slice(0, start);
-    const middle = content.slice(start, end);
-    if (!middle.trim()) return;
+    if (!reader || !novel || !highlightMenu.visible) return;
 
     const nextHighlight = {
-      start: before.length,
-      end: before.length + middle.length
+      start: highlightMenu.start,
+      end: highlightMenu.end
     };
 
     const nextNovels = novels.map((entry) =>
       entry.id === novel.id
         ? {
             ...entry,
-            content,
+            content: highlightMenu.content || normalizeText(reader.innerText || ""),
             highlight: nextHighlight,
             scrollTop: reader.scrollTop,
             fontSize,
@@ -509,6 +537,7 @@ export default function App() {
         activeNovelId: novel.id
       })
     );
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
     queueAutoSync();
   }
 
@@ -761,13 +790,12 @@ export default function App() {
       >
         <div className="chrome-hover-zone" aria-hidden="true" />
         <div className="topbar">
-          <div className="novel-status">
-            <button className="back-button" type="button" aria-label="Back to library" onClick={handleBackToLibrary}>
-              &#8592;
-            </button>
-          </div>
-
           <div className="controls" aria-label="Reader controls">
+            <div className="control-group" aria-label="Navigation controls">
+              <button className="back-button" type="button" aria-label="Back to library" onClick={handleBackToLibrary}>
+                &#8592;
+              </button>
+            </div>
             <div className="control-group" aria-label="Font size controls">
               <button type="button" aria-label="Decrease text size" onClick={() => applyFontSize(fontSize - FONT_STEP)}>
                 -
@@ -824,12 +852,38 @@ export default function App() {
           aria-label="Reading area"
           onInput={handleReaderInput}
           onPaste={handleReaderPaste}
-          onDoubleClick={handleReaderDoubleClick}
+          onContextMenu={(event) => {
+            const range = getSelectionHighlightRange();
+            if (!range) {
+              setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0 });
+              return;
+            }
+            event.preventDefault();
+            setHighlightMenu({
+              visible: true,
+              x: event.clientX,
+              y: event.clientY,
+              start: range.start,
+              end: range.end,
+              content: range.content
+            });
+          }}
           onScroll={() => {
             updatePageMetrics();
             queueScrollSave();
           }}
         />
+
+        {highlightMenu.visible ? (
+          <button
+            type="button"
+            className="highlight-menu"
+            style={{ left: highlightMenu.x, top: highlightMenu.y }}
+            onClick={applyHighlightFromMenu}
+          >
+            Highlight
+          </button>
+        ) : null}
 
         <div className="page-counter" id="pageCounter">
           Page {pageMetrics.current} of {pageMetrics.total}
