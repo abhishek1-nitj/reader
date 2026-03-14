@@ -10,6 +10,19 @@ const MAX_LINE_HEIGHT = 2.4;
 const FONT_STEP = 1;
 const LINE_HEIGHT_STEP = 0.02;
 
+let pdfJsLoader = null;
+
+async function loadPdfJs() {
+  if (!pdfJsLoader) {
+    pdfJsLoader = import("pdfjs-dist").then((module) => {
+      module.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
+      return module;
+    });
+  }
+
+  return pdfJsLoader;
+}
+
 function normalizeText(text) {
   return text
     .replace(/\r\n?/g, "\n")
@@ -91,6 +104,111 @@ function createNovel(title) {
   };
 }
 
+function cleanPdfTitle(value) {
+  if (typeof value !== "string") return "";
+  const title = normalizeText(value.replace(/\0/g, " ")).replace(/\s+/g, " ").trim();
+  if (!title) return "";
+
+  const lowered = title.toLowerCase();
+  if (["untitled", "microsoft word", "default", "document", "pdf"].includes(lowered)) {
+    return "";
+  }
+
+  return title.length > 160 ? title.slice(0, 160).trim() : title;
+}
+
+function titleFromFilename(filename) {
+  const base = (filename || "").replace(/\.pdf$/i, "");
+  return cleanPdfTitle(base.replace(/[_-]+/g, " "));
+}
+
+function inferTitleFromText(text) {
+  const candidates = normalizeText(text)
+    .split("\n")
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  return (
+    candidates.find((line) => line.length >= 4 && line.length <= 120 && line.split(/\s+/).length <= 14) ||
+    candidates.find((line) => line.length <= 160) ||
+    ""
+  );
+}
+
+function derivePdfTitle(metadata, text, filename) {
+  const metadataTitle =
+    cleanPdfTitle(metadata?.info?.Title) ||
+    cleanPdfTitle(metadata?.metadata?.get?.("dc:title")) ||
+    cleanPdfTitle(metadata?.contentDispositionFilename);
+
+  return metadataTitle || cleanPdfTitle(inferTitleFromText(text)) || titleFromFilename(filename) || "Imported PDF";
+}
+
+function joinPdfLineSegments(segments) {
+  return segments.reduce((line, segment, index) => {
+    const text = segment.str.replace(/\s+/g, " ").trim();
+    if (!text) return line;
+    if (index === 0) return text;
+
+    const previous = segments[index - 1];
+    const previousText = previous.str.replace(/\s+/g, " ").trim();
+    const previousRight = Number(previous.transform?.[4] || 0) + Number(previous.width || 0);
+    const currentLeft = Number(segment.transform?.[4] || 0);
+    const gap = currentLeft - previousRight;
+    const needsSpace =
+      gap > 1.5 &&
+      !/[-/(\[]$/.test(previousText) &&
+      !/^[,.;:!?%)\]]/.test(text);
+
+    return `${line}${needsSpace ? " " : ""}${text}`;
+  }, "");
+}
+
+function extractPageText(textContent) {
+  const positionedItems = textContent.items
+    .filter((item) => typeof item?.str === "string" && item.str.trim())
+    .map((item) => ({
+      ...item,
+      y: Math.round(Number(item.transform?.[5] || 0) * 10) / 10,
+      x: Number(item.transform?.[4] || 0)
+    }));
+
+  if (positionedItems.length === 0) return "";
+
+  const linesByY = new Map();
+  positionedItems.forEach((item) => {
+    const key = String(item.y);
+    const existing = linesByY.get(key) || [];
+    existing.push(item);
+    linesByY.set(key, existing);
+  });
+
+  const lines = Array.from(linesByY.entries())
+    .map(([y, items]) => ({
+      y: Number(y),
+      text: joinPdfLineSegments(items.sort((a, b) => a.x - b.x))
+    }))
+    .filter((line) => line.text)
+    .sort((a, b) => b.y - a.y);
+
+  if (lines.length === 0) return "";
+
+  const gaps = [];
+  for (let index = 1; index < lines.length; index += 1) {
+    gaps.push(Math.abs(lines[index - 1].y - lines[index].y));
+  }
+  const sortedGaps = gaps.slice().sort((a, b) => a - b);
+  const baselineGap = sortedGaps[Math.floor(sortedGaps.length / 2)] || 12;
+
+  return lines
+    .map((line, index) => {
+      if (index === 0) return line.text;
+      const gap = Math.abs(lines[index - 1].y - line.y);
+      return `${gap > baselineGap * 1.45 ? "\n\n" : "\n"}${line.text}`;
+    })
+    .join("");
+}
+
 function getTextOffset(root, node, nodeOffset) {
   const range = document.createRange();
   range.selectNodeContents(root);
@@ -116,8 +234,11 @@ export default function App() {
   const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(initialSettings.supabaseAnonKey || "");
   const [settingsStatus, setSettingsStatus] = useState(initialSettings.lastSyncMessage || "");
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
+  const [pdfImportStatus, setPdfImportStatus] = useState("");
+  const [isImportingPdf, setIsImportingPdf] = useState(false);
 
   const readerRef = useRef(null);
+  const pdfInputRef = useRef(null);
   const previousRenderedNovelIdRef = useRef(null);
   const saveTimerRef = useRef(null);
   const scrollTimerRef = useRef(null);
@@ -455,6 +576,73 @@ export default function App() {
     updatePageMetrics();
   }
 
+  async function extractPdfBook(file) {
+    const { getDocument } = await loadPdfJs();
+    const arrayBuffer = await file.arrayBuffer();
+    const loadingTask = getDocument({
+      data: arrayBuffer,
+      useWorkerFetch: false,
+      isEvalSupported: false
+    });
+
+    const pdf = await loadingTask.promise;
+    const metadata = await pdf.getMetadata().catch(() => null);
+    const pages = [];
+
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      const page = await pdf.getPage(pageNumber);
+      const textContent = await page.getTextContent();
+      const pageText = extractPageText(textContent);
+      if (pageText) {
+        pages.push(pageText);
+      }
+    }
+
+    const content = normalizeText(pages.join("\n\n"));
+    if (!content) {
+      throw new Error("No readable text was found in this PDF.");
+    }
+
+    return {
+      title: derivePdfTitle(metadata, content, file.name),
+      content
+    };
+  }
+
+  async function handlePdfSelection(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    flushPendingSaves();
+    setIsImportingPdf(true);
+    setPdfImportStatus(`Importing ${file.name}...`);
+
+    try {
+      const importedBook = await extractPdfBook(file);
+      const novel = createNovel(importedBook.title);
+      novel.title = importedBook.title;
+      novel.content = importedBook.content;
+      novel.updatedAt = Date.now();
+
+      setNovels((current) => [...current, novel]);
+      setActiveNovelId(novel.id);
+      setTitleInput(novel.title);
+      setViewMode("reader");
+      setSearchQuery("");
+      setShowChrome(false);
+      setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+      previousRenderedNovelIdRef.current = null;
+      setPdfImportStatus(`Imported "${novel.title}".`);
+      queueAutoSync();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "PDF import failed.";
+      setPdfImportStatus(message);
+    } finally {
+      setIsImportingPdf(false);
+    }
+  }
+
   function handleSaveNovel() {
     const title = (titleInput || "").trim() || "Untitled Novel";
     if (!activeNovel) {
@@ -691,6 +879,24 @@ export default function App() {
 
         <div className="library-actions">
           <input
+            ref={pdfInputRef}
+            type="file"
+            accept="application/pdf,.pdf"
+            className="file-input"
+            onChange={handlePdfSelection}
+          />
+          <button
+            className="import-card"
+            type="button"
+            onClick={() => pdfInputRef.current?.click()}
+            disabled={isImportingPdf}
+          >
+            <span className="import-card-kicker">{isImportingPdf ? "Importing PDF" : "Attach PDF"}</span>
+            <span className="import-card-title">
+              {isImportingPdf ? "Reading pages and creating a new book..." : "Load a PDF as a saved book"}
+            </span>
+          </button>
+          <input
             className="input"
             type="text"
             placeholder="Novel title"
@@ -705,6 +911,9 @@ export default function App() {
             <button className="action-button primary" type="button" onClick={handleSaveNovel}>
               Save
             </button>
+          </div>
+          <div className="import-status" aria-live="polite">
+            {pdfImportStatus}
           </div>
         </div>
 
