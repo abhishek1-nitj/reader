@@ -111,8 +111,8 @@ input {
 }
 
 .action-button.primary {
-  background: var(--accent);
-  color: #f7f4eb;
+  background: #dbc7aa;
+  color: #4b3b2a;
 }
 
 .library-search {
