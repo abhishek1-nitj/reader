@@ -5,6 +5,7 @@ const SETTINGS_KEY = "reader-settings-v1";
 const DB_NAME = "reader-library-db";
 const STORE_NAME = "reader-library-store";
 const RECORD_KEY = "library-state";
+const SUPABASE_LIBRARY_ID = "primary";
 const CHROME_REVEAL_HEIGHT = 90;
 const MIN_SIZE = 14;
 const MAX_SIZE = 72;
@@ -158,14 +159,18 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [supabaseUrlInput, setSupabaseUrlInput] = useState(initialSettings.supabaseUrl || "");
   const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(initialSettings.supabaseAnonKey || "");
+  const [settingsStatus, setSettingsStatus] = useState(initialSettings.lastSyncMessage || "Supabase not connected.");
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
   const [isReady, setIsReady] = useState(false);
 
   const readerRef = useRef(null);
   const saveTimerRef = useRef(null);
   const scrollTimerRef = useRef(null);
+  const syncTimerRef = useRef(null);
   const previousRenderedBookIdRef = useRef(null);
   const lastPersistedRef = useRef("");
+  const syncInFlightRef = useRef(false);
+  const applyingRemoteRef = useRef(false);
 
   const activeBook = books.find((book) => book.id === activeBookId) || null;
 
@@ -221,11 +226,18 @@ export default function App() {
   }, [activeBookId, books, isReady]);
 
   useEffect(() => {
+    if (!isReady) return;
+    if (!getSyncConfig().isConfigured) return;
+    void syncWithSupabase({ preferRemote: true });
+  }, [isReady]);
+
+  useEffect(() => {
     saveSettings({
       supabaseUrl: supabaseUrlInput.trim(),
-      supabaseAnonKey: supabaseAnonKeyInput.trim()
+      supabaseAnonKey: supabaseAnonKeyInput.trim(),
+      lastSyncMessage: settingsStatus
     });
-  }, [supabaseAnonKeyInput, supabaseUrlInput]);
+  }, [settingsStatus, supabaseAnonKeyInput, supabaseUrlInput]);
 
   useEffect(() => {
     if (!activeBook) return;
@@ -308,11 +320,33 @@ export default function App() {
   function clearTimers() {
     window.clearTimeout(saveTimerRef.current);
     window.clearTimeout(scrollTimerRef.current);
+    window.clearTimeout(syncTimerRef.current);
+  }
+
+  function getSyncConfig() {
+    const supabaseUrl = supabaseUrlInput.trim().replace(/\/+$/, "");
+    const supabaseAnonKey = supabaseAnonKeyInput.trim();
+    return {
+      supabaseUrl,
+      supabaseAnonKey,
+      libraryId: SUPABASE_LIBRARY_ID,
+      isConfigured: Boolean(supabaseUrl && supabaseAnonKey)
+    };
+  }
+
+  function queueAutoSync() {
+    const config = getSyncConfig();
+    if (!config.isConfigured || applyingRemoteRef.current) return;
+    window.clearTimeout(syncTimerRef.current);
+    syncTimerRef.current = window.setTimeout(() => {
+      void syncWithSupabase();
+    }, 600);
   }
 
   function commitLibrary(nextBooks, nextActiveBookId = activeBookId) {
     setBooks(nextBooks);
     setActiveBookId(nextActiveBookId);
+    queueAutoSync();
   }
 
   function buildReaderSnapshot() {
@@ -492,6 +526,102 @@ export default function App() {
       ),
       activeBook.id
     );
+  }
+
+  async function pullFromSupabase(config) {
+    const url = `${config.supabaseUrl}/rest/v1/reader_libraries?id=eq.${encodeURIComponent(config.libraryId)}&select=*`;
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        apikey: config.supabaseAnonKey,
+        Authorization: `Bearer ${config.supabaseAnonKey}`
+      }
+    });
+
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(`Fetch failed (${response.status})${details ? `: ${details}` : ""}`);
+    }
+
+    const rows = await response.json();
+    return Array.isArray(rows) ? rows[0] || null : null;
+  }
+
+  async function pushToSupabase(config, snapshot) {
+    const payload = {
+      id: config.libraryId,
+      books: snapshot.nextBooks,
+      active_book_id: snapshot.nextActiveBookId
+    };
+
+    const response = await fetch(`${config.supabaseUrl}/rest/v1/reader_libraries`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates",
+        apikey: config.supabaseAnonKey,
+        Authorization: `Bearer ${config.supabaseAnonKey}`
+      },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(`Push failed (${response.status})${details ? `: ${details}` : ""}`);
+    }
+  }
+
+  function applyRemoteLibrary(row) {
+    applyingRemoteRef.current = true;
+    setBooks(Array.isArray(row?.books) ? row.books : []);
+    setActiveBookId(typeof row?.active_book_id === "string" ? row.active_book_id : null);
+    applyingRemoteRef.current = false;
+  }
+
+  async function syncWithSupabase({ preferRemote = false, manual = false } = {}) {
+    const config = getSyncConfig();
+    if (!config.isConfigured) {
+      setSettingsStatus("Enter the Supabase URL and anon key first.");
+      return;
+    }
+
+    if (syncInFlightRef.current) return;
+    syncInFlightRef.current = true;
+
+    try {
+      const snapshot = buildReaderSnapshot();
+
+      if (preferRemote) {
+        const remote = await pullFromSupabase(config);
+        if (remote) {
+          applyRemoteLibrary(remote);
+        } else {
+          await pushToSupabase(config, snapshot);
+        }
+      } else {
+        await pushToSupabase(config, snapshot);
+        const remote = await pullFromSupabase(config);
+        if (remote) {
+          applyRemoteLibrary(remote);
+        }
+      }
+
+      const message = `Last synced ${new Date().toLocaleString()}`;
+      setSettingsStatus(message);
+      saveSettings({
+        supabaseUrl: config.supabaseUrl,
+        supabaseAnonKey: config.supabaseAnonKey,
+        lastSyncMessage: message
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Sync failed";
+      setSettingsStatus(message);
+      if (manual) {
+        throw error;
+      }
+    } finally {
+      syncInFlightRef.current = false;
+    }
   }
 
   return (
@@ -761,8 +891,18 @@ export default function App() {
             <button className="action-button" type="button" onClick={() => setSettingsOpen(false)}>
               Close
             </button>
+            <button
+              className="action-button primary"
+              type="button"
+              onClick={async () => {
+                setSettingsStatus("Syncing...");
+                await syncWithSupabase({ manual: true });
+              }}
+            >
+              Sync
+            </button>
           </div>
-          <div className="settings-status">Saved locally on this device.</div>
+          <div className="settings-status">{settingsStatus}</div>
         </div>
       </div>
     </div>
