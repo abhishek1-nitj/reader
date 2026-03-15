@@ -1,10 +1,9 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 const STORAGE_KEY = "reader-library-v1";
-const SETTINGS_KEY = "reader-settings-v1";
-const LIBRARY_DB_NAME = "reader-library-db";
-const LIBRARY_STORE_NAME = "reader-library-store";
-const LIBRARY_RECORD_KEY = "library-state";
+const DB_NAME = "reader-library-db";
+const STORE_NAME = "reader-library-store";
+const RECORD_KEY = "library-state";
 const CHROME_REVEAL_HEIGHT = 90;
 const MIN_SIZE = 14;
 const MAX_SIZE = 72;
@@ -12,6 +11,82 @@ const MIN_LINE_HEIGHT = 1;
 const MAX_LINE_HEIGHT = 2.4;
 const FONT_STEP = 1;
 const LINE_HEIGHT_STEP = 0.02;
+
+let databasePromise = null;
+
+function openDatabase() {
+  if (!databasePromise) {
+    databasePromise = new Promise((resolve, reject) => {
+      const request = window.indexedDB.open(DB_NAME, 1);
+
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains(STORE_NAME)) {
+          database.createObjectStore(STORE_NAME);
+        }
+      };
+
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("Unable to open IndexedDB."));
+    });
+  }
+
+  return databasePromise;
+}
+
+async function readLibraryState() {
+  const database = await openDatabase();
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, "readonly");
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.get(RECORD_KEY);
+
+    request.onsuccess = () => {
+      const value = request.result;
+      resolve({
+        books: Array.isArray(value?.books) ? value.books : [],
+        activeBookId: typeof value?.activeBookId === "string" ? value.activeBookId : null
+      });
+    };
+    request.onerror = () => reject(request.error || new Error("Unable to read the saved library."));
+  });
+}
+
+async function writeLibraryState(nextState) {
+  const database = await openDatabase();
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(STORE_NAME, "readwrite");
+    const store = transaction.objectStore(STORE_NAME);
+    store.put(nextState, RECORD_KEY);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("Unable to save the library."));
+    transaction.onabort = () => reject(transaction.error || new Error("Saving the library was aborted."));
+  });
+}
+
+function loadLegacyLibraryState() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+    return {
+      books: Array.isArray(parsed.novels) ? parsed.novels : [],
+      activeBookId: typeof parsed.activeNovelId === "string" ? parsed.activeNovelId : null
+    };
+  } catch {
+    return { books: [], activeBookId: null };
+  }
+}
+
+function clampFontSize(value) {
+  if (Number.isNaN(value)) return 17;
+  return Math.min(MAX_SIZE, Math.max(MIN_SIZE, value));
+}
+
+function clampLineHeight(value) {
+  if (Number.isNaN(value)) return 1.35;
+  return Math.min(MAX_LINE_HEIGHT, Math.max(MIN_LINE_HEIGHT, value));
+}
 
 function normalizeText(text) {
   return text
@@ -25,290 +100,163 @@ function normalizeText(text) {
 }
 
 function escapeHtml(text) {
-  return text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function buildReaderHtml(text, highlight) {
-  const safeText = text || "";
-  if (!highlight || typeof highlight.start !== "number" || typeof highlight.end !== "number") {
-    return escapeHtml(safeText).replace(/\n/g, "<br>");
-  }
-
-  const start = Math.max(0, Math.min(safeText.length, highlight.start));
-  const end = Math.max(start, Math.min(safeText.length, highlight.end));
-  const before = escapeHtml(safeText.slice(0, start));
-  const middle = escapeHtml(safeText.slice(start, end));
-  const after = escapeHtml(safeText.slice(end));
-  return `${before}<mark>${middle}</mark>${after}`.replace(/\n/g, "<br>");
+function buildReaderHtml(text) {
+  return escapeHtml(text || "").replace(/\n/g, "<br>");
 }
 
-function loadLibraryState() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-    return {
-      novels: Array.isArray(parsed.novels) ? parsed.novels : [],
-      activeNovelId: typeof parsed.activeNovelId === "string" ? parsed.activeNovelId : null
-    };
-  } catch {
-    return { novels: [], activeNovelId: null };
-  }
-}
-
-let libraryDatabasePromise = null;
-
-function openLibraryDatabase() {
-  if (!libraryDatabasePromise) {
-    libraryDatabasePromise = new Promise((resolve, reject) => {
-      const request = window.indexedDB.open(LIBRARY_DB_NAME, 1);
-
-      request.onupgradeneeded = () => {
-        const database = request.result;
-        if (!database.objectStoreNames.contains(LIBRARY_STORE_NAME)) {
-          database.createObjectStore(LIBRARY_STORE_NAME);
-        }
-      };
-
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error("Unable to open IndexedDB."));
-    });
-  }
-
-  return libraryDatabasePromise;
-}
-
-async function readLibraryStateFromIndexedDb() {
-  const database = await openLibraryDatabase();
-
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(LIBRARY_STORE_NAME, "readonly");
-    const store = transaction.objectStore(LIBRARY_STORE_NAME);
-    const request = store.get(LIBRARY_RECORD_KEY);
-
-    request.onsuccess = () => {
-      const parsed = request.result;
-      resolve({
-        novels: Array.isArray(parsed?.novels) ? parsed.novels : [],
-        activeNovelId: typeof parsed?.activeNovelId === "string" ? parsed.activeNovelId : null
-      });
-    };
-    request.onerror = () => reject(request.error || new Error("Unable to read library from IndexedDB."));
-  });
-}
-
-async function writeLibraryStateToIndexedDb(nextState) {
-  const database = await openLibraryDatabase();
-
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(LIBRARY_STORE_NAME, "readwrite");
-    const store = transaction.objectStore(LIBRARY_STORE_NAME);
-    store.put(nextState, LIBRARY_RECORD_KEY);
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error || new Error("Unable to save library to IndexedDB."));
-    transaction.onabort = () => reject(transaction.error || new Error("Saving library to IndexedDB was aborted."));
-  });
-}
-
-function loadAppSettings() {
-  try {
-    return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-  } catch {
-    return {};
-  }
-}
-
-function saveAppSettings(settings) {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-}
-
-function clampFontSize(value) {
-  if (Number.isNaN(value)) return 17;
-  return Math.min(MAX_SIZE, Math.max(MIN_SIZE, value));
-}
-
-function clampLineHeight(value) {
-  if (Number.isNaN(value)) return 1.35;
-  return Math.min(MAX_LINE_HEIGHT, Math.max(MIN_LINE_HEIGHT, value));
-}
-
-function createNovel(title) {
-  const settings = loadAppSettings();
+function createBook(title) {
   const now = Date.now();
   return {
-    id: `novel-${now}-${Math.random().toString(36).slice(2, 8)}`,
-    title,
+    id: `book-${now}-${Math.random().toString(36).slice(2, 8)}`,
+    title: title || "Untitled Book",
     content: "",
     scrollTop: 0,
-    highlight: null,
-    fontSize: clampFontSize(parseInt(String(settings.fontSize || 17), 10)),
-    lineHeight: clampLineHeight(parseFloat(String(settings.lineHeight || 1.35))),
+    fontSize: 17,
+    lineHeight: 1.35,
     updatedAt: now
   };
 }
 
-function getTextOffset(root, node, nodeOffset) {
-  const range = document.createRange();
-  range.selectNodeContents(root);
-  range.setEnd(node, nodeOffset);
-  return range.toString().length;
+function buildReaderHash(bookId) {
+  return `#reader=${encodeURIComponent(bookId)}`;
 }
 
-function buildReaderHash(novelId) {
-  return `#reader=${encodeURIComponent(novelId)}`;
-}
-
-function getNovelIdFromHash() {
+function getBookIdFromHash() {
   const hash = window.location.hash || "";
   if (!hash.startsWith("#reader=")) return null;
-  const encodedNovelId = hash.slice("#reader=".length);
-  return encodedNovelId ? decodeURIComponent(encodedNovelId) : null;
+  const value = hash.slice("#reader=".length);
+  return value ? decodeURIComponent(value) : null;
 }
 
 export default function App() {
-  const initialSettings = useMemo(() => loadAppSettings(), []);
-  const [novels, setNovels] = useState([]);
-  const [activeNovelId, setActiveNovelId] = useState(null);
+  const [books, setBooks] = useState([]);
+  const [activeBookId, setActiveBookId] = useState(null);
   const [viewMode, setViewMode] = useState("library");
-  const [titleInput, setTitleInput] = useState("");
+  const [draftTitle, setDraftTitle] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
   const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState(-1);
-  const [fontSize, setFontSize] = useState(clampFontSize(parseInt(String(initialSettings.fontSize || 17), 10)));
-  const [lineHeight, setLineHeight] = useState(clampLineHeight(parseFloat(String(initialSettings.lineHeight || 1.35))));
+  const [fontSize, setFontSize] = useState(17);
+  const [lineHeight, setLineHeight] = useState(1.35);
   const [showChrome, setShowChrome] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [highlightMenu, setHighlightMenu] = useState({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
-  const [supabaseUrlInput, setSupabaseUrlInput] = useState(initialSettings.supabaseUrl || "");
-  const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(initialSettings.supabaseAnonKey || "");
-  const [settingsStatus, setSettingsStatus] = useState(initialSettings.lastSyncMessage || "");
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
-  const [isLibraryReady, setIsLibraryReady] = useState(false);
+  const [isReady, setIsReady] = useState(false);
 
   const readerRef = useRef(null);
-  const previousRenderedNovelIdRef = useRef(null);
   const saveTimerRef = useRef(null);
   const scrollTimerRef = useRef(null);
-  const syncTimerRef = useRef(null);
-  const routeInitializedRef = useRef(false);
-  const syncInFlightRef = useRef(false);
-  const syncingSuppressedRef = useRef(false);
-  const deletedNovelIdsRef = useRef(Array.isArray(initialSettings.deletedNovelIds) ? initialSettings.deletedNovelIds : []);
+  const previousRenderedBookIdRef = useRef(null);
+  const lastPersistedRef = useRef("");
 
-  const activeNovel = novels.find((novel) => novel.id === activeNovelId) || null;
+  const activeBook = books.find((book) => book.id === activeBookId) || null;
 
-  const sortedNovels = useMemo(
-    () => [...novels].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
-    [novels]
+  const sortedBooks = useMemo(
+    () => [...books].sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
+    [books]
   );
 
-  const matchingNovels = useMemo(() => {
-    const normalizedQuery = searchQuery.trim().toLowerCase();
-    if (!normalizedQuery) return sortedNovels.slice(0, 8);
-    return sortedNovels.filter((novel) => (novel.title || "").toLowerCase().includes(normalizedQuery)).slice(0, 8);
-  }, [searchQuery, sortedNovels]);
+  const matchingBooks = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase();
+    if (!query) return sortedBooks.slice(0, 8);
+    return sortedBooks.filter((book) => (book.title || "").toLowerCase().includes(query)).slice(0, 8);
+  }, [searchQuery, sortedBooks]);
 
   useEffect(() => {
     let cancelled = false;
 
-    async function hydrateLibrary() {
+    async function hydrate() {
       try {
-        const indexedState = await readLibraryStateFromIndexedDb();
-        const legacyState = loadLibraryState();
-        const shouldMigrateLegacy = indexedState.novels.length === 0 && legacyState.novels.length > 0;
-        const nextState = shouldMigrateLegacy ? legacyState : indexedState;
+        const indexed = await readLibraryState();
+        const legacy = loadLegacyLibraryState();
+        const nextState = indexed.books.length > 0 ? indexed : legacy;
 
-        if (shouldMigrateLegacy) {
-          await writeLibraryStateToIndexedDb(nextState);
+        if (indexed.books.length === 0 && legacy.books.length > 0) {
+          await writeLibraryState(nextState);
           localStorage.removeItem(STORAGE_KEY);
         }
 
         if (cancelled) return;
-        setNovels(nextState.novels);
-        setActiveNovelId(nextState.activeNovelId);
-      } catch (error) {
-        if (cancelled) return;
-        const legacyState = loadLibraryState();
-        setNovels(legacyState.novels);
-        setActiveNovelId(legacyState.activeNovelId);
-        setSettingsStatus(error instanceof Error ? error.message : "Unable to load saved books.");
+        setBooks(nextState.books);
+        setActiveBookId(nextState.activeBookId);
       } finally {
         if (!cancelled) {
-          setIsLibraryReady(true);
+          setIsReady(true);
         }
       }
     }
 
-    void hydrateLibrary();
-
+    void hydrate();
     return () => {
       cancelled = true;
     };
   }, []);
 
   useEffect(() => {
-    if (!isLibraryReady) return;
+    if (!isReady) return;
 
-    void writeLibraryStateToIndexedDb({
-      novels,
-      activeNovelId
-    }).catch((error) => {
-      setSettingsStatus(error instanceof Error ? error.message : "Unable to save the library.");
-    });
-  }, [activeNovelId, isLibraryReady, novels]);
+    const payload = JSON.stringify({ books, activeBookId });
+    if (payload === lastPersistedRef.current) return;
+    lastPersistedRef.current = payload;
 
-  useEffect(() => {
-    saveAppSettings({
-      ...loadAppSettings(),
-      fontSize,
-      lineHeight,
-      supabaseUrl: supabaseUrlInput.trim(),
-      supabaseAnonKey: supabaseAnonKeyInput.trim(),
-      lastSyncMessage: settingsStatus,
-      deletedNovelIds: deletedNovelIdsRef.current
-    });
-  }, [fontSize, lineHeight, settingsStatus, supabaseUrlInput, supabaseAnonKeyInput]);
+    void writeLibraryState({ books, activeBookId });
+  }, [activeBookId, books, isReady]);
 
   useEffect(() => {
-    if (activeNovel) {
-      setTitleInput(activeNovel.title || "");
-    } else if (viewMode === "library") {
-      setTitleInput("");
-    }
-  }, [activeNovel, viewMode]);
-
-  useEffect(() => {
-    if (!activeNovel) return;
-    setFontSize(clampFontSize(parseInt(String(activeNovel.fontSize || 17), 10)));
-    setLineHeight(clampLineHeight(parseFloat(String(activeNovel.lineHeight || 1.35))));
-  }, [activeNovel?.id, activeNovel?.fontSize, activeNovel?.lineHeight]);
+    if (!activeBook) return;
+    setFontSize(clampFontSize(parseInt(String(activeBook.fontSize || 17), 10)));
+    setLineHeight(clampLineHeight(parseFloat(String(activeBook.lineHeight || 1.35))));
+  }, [activeBook]);
 
   useEffect(() => {
     const reader = readerRef.current;
     if (!reader) return;
 
-    const desiredContent = activeNovel?.content || "";
-    const desiredHighlight = activeNovel?.highlight || null;
-    const desiredMarkedText = desiredHighlight ? desiredContent.slice(desiredHighlight.start, desiredHighlight.end) : null;
+    const desiredContent = activeBook?.content || "";
+    const bookChanged = previousRenderedBookIdRef.current !== (activeBook?.id || null);
     const currentContent = normalizeText(reader.innerText || "");
-    const currentMarkedText = reader.querySelector("mark")?.innerText ?? null;
-    const novelChanged = previousRenderedNovelIdRef.current !== (activeNovel?.id || null);
 
-    if (novelChanged || currentContent !== desiredContent || currentMarkedText !== desiredMarkedText) {
-      reader.innerHTML = buildReaderHtml(desiredContent, desiredHighlight);
+    if (bookChanged || currentContent !== desiredContent) {
+      reader.innerHTML = buildReaderHtml(desiredContent);
     }
 
-    if (novelChanged) {
-      reader.scrollTop = activeNovel?.scrollTop || 0;
+    if (bookChanged) {
+      reader.scrollTop = activeBook?.scrollTop || 0;
     }
 
-    previousRenderedNovelIdRef.current = activeNovel?.id || null;
+    previousRenderedBookIdRef.current = activeBook?.id || null;
     updatePageMetrics();
-  }, [activeNovel?.content, activeNovel?.highlight, activeNovel?.id]);
+  }, [activeBook?.content, activeBook?.id, activeBook?.scrollTop]);
 
   useEffect(() => {
-    const handleBeforeUnload = () => flushPendingSaves();
-    const handleVisibility = () => {
+    if (!isReady) return;
+
+    const applyRoute = () => {
+      const bookId = getBookIdFromHash();
+      if (bookId && books.some((book) => book.id === bookId)) {
+        setActiveBookId(bookId);
+        setViewMode("reader");
+        setShowChrome(false);
+        return;
+      }
+
+      setViewMode("library");
+      setShowChrome(false);
+    };
+
+    applyRoute();
+    window.addEventListener("hashchange", applyRoute);
+    return () => {
+      window.removeEventListener("hashchange", applyRoute);
+    };
+  }, [books, isReady]);
+
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      flushPendingSaves();
+    };
+    const handleVisibilityChange = () => {
       if (document.visibilityState === "hidden") {
         flushPendingSaves();
       }
@@ -316,84 +264,14 @@ export default function App() {
 
     window.addEventListener("beforeunload", handleBeforeUnload);
     window.addEventListener("pagehide", handleBeforeUnload);
-    document.addEventListener("visibilitychange", handleVisibility);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
     return () => {
       window.removeEventListener("beforeunload", handleBeforeUnload);
       window.removeEventListener("pagehide", handleBeforeUnload);
-      document.removeEventListener("visibilitychange", handleVisibility);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, []);
-
-  useEffect(() => {
-    const handlePointerDown = (event) => {
-      if (event.target.closest(".highlight-menu")) return;
-      setHighlightMenu((current) => (current.visible ? { visible: false, x: 0, y: 0, start: 0, end: 0, content: "" } : current));
-    };
-
-    document.addEventListener("pointerdown", handlePointerDown);
-    return () => {
-      document.removeEventListener("pointerdown", handlePointerDown);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isLibraryReady) return;
-    setViewMode("library");
-    if (!getNovelIdFromHash()) {
-      window.history.replaceState(null, "", window.location.pathname + window.location.search);
-    }
-    if (getSyncConfig().isConfigured) {
-      void syncWithSupabase();
-    }
-  }, [isLibraryReady]);
-
-  useEffect(() => {
-    if (!isLibraryReady) return undefined;
-
-    const applyRoute = () => {
-      const novelId = getNovelIdFromHash();
-      if (novelId && novels.some((novel) => novel.id === novelId)) {
-        setActiveNovelId(novelId);
-        setViewMode("reader");
-        setShowChrome(false);
-        setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
-      } else {
-        flushPendingSaves();
-        showLibraryView();
-      }
-    };
-
-    if (!routeInitializedRef.current) {
-      routeInitializedRef.current = true;
-      applyRoute();
-    }
-
-    window.addEventListener("hashchange", applyRoute);
-    return () => {
-      window.removeEventListener("hashchange", applyRoute);
-    };
-  }, [isLibraryReady, novels]);
-
-  function getSettingsWithDeviceId() {
-    const settings = loadAppSettings();
-    if (!settings.deviceId) {
-      settings.deviceId = window.crypto.randomUUID();
-      saveAppSettings(settings);
-    }
-    return settings;
-  }
-
-  function getSyncConfig() {
-    const settings = getSettingsWithDeviceId();
-    const supabaseUrl = (supabaseUrlInput || settings.supabaseUrl || "").trim().replace(/\/+$/, "");
-    const supabaseAnonKey = (supabaseAnonKeyInput || settings.supabaseAnonKey || "").trim();
-    return {
-      ...settings,
-      supabaseUrl,
-      supabaseAnonKey,
-      isConfigured: Boolean(supabaseUrl && supabaseAnonKey)
-    };
-  }
+  }, [activeBookId, books, draftTitle, fontSize, lineHeight]);
 
   function updatePageMetrics() {
     const reader = readerRef.current;
@@ -403,546 +281,193 @@ export default function App() {
     setPageMetrics({ current, total });
   }
 
-  function updateNovelById(id, updater) {
-    setNovels((current) =>
-      current.map((novel) => {
-        if (novel.id !== id) return novel;
-        return updater(novel);
-      })
-    );
-  }
-
-  function clearPendingTimers() {
+  function clearTimers() {
     window.clearTimeout(saveTimerRef.current);
     window.clearTimeout(scrollTimerRef.current);
-    window.clearTimeout(syncTimerRef.current);
   }
 
-  function persistLibrarySnapshot(nextNovels, nextActiveNovelId) {
-    if (!isLibraryReady) {
-      return Promise.resolve();
-    }
-
-    return writeLibraryStateToIndexedDb({
-      novels: nextNovels,
-      activeNovelId: nextActiveNovelId
-    }).catch((error) => {
-      setSettingsStatus(error instanceof Error ? error.message : "Unable to save the library.");
-    });
+  function commitLibrary(nextBooks, nextActiveBookId = activeBookId) {
+    setBooks(nextBooks);
+    setActiveBookId(nextActiveBookId);
   }
 
-  function persistDeletedNovelIds(nextDeletedNovelIds) {
-    deletedNovelIdsRef.current = nextDeletedNovelIds;
-    saveAppSettings({
-      ...loadAppSettings(),
-      fontSize,
-      lineHeight,
-      supabaseUrl: supabaseUrlInput.trim(),
-      supabaseAnonKey: supabaseAnonKeyInput.trim(),
-      lastSyncMessage: settingsStatus,
-      deletedNovelIds: nextDeletedNovelIds
-    });
-  }
-
-  function commitLibraryState(nextNovels, nextActiveNovelId = activeNovelId) {
-    setNovels(nextNovels);
-    setActiveNovelId(nextActiveNovelId);
-    return persistLibrarySnapshot(nextNovels, nextActiveNovelId);
-  }
-
-  function getSelectionHighlightRange() {
-    const reader = readerRef.current;
-    const selection = window.getSelection();
-    if (!reader || !selection || selection.rangeCount === 0) return null;
-    const range = selection.getRangeAt(0);
-    if (!reader.contains(range.commonAncestorContainer)) return null;
-    const selectedText = selection.toString();
-    if (!selectedText.trim()) return null;
-
-    const start = getTextOffset(reader, range.startContainer, range.startOffset);
-    const end = getTextOffset(reader, range.endContainer, range.endOffset);
-    if (end <= start) return null;
-
-    const content = normalizeText(reader.innerText || "");
-    const middle = content.slice(start, end);
-    if (!middle.trim()) return null;
-
-    return {
-      start,
-      end,
-      content
-    };
-  }
-
-  function applyFontSize(nextValue) {
-    const next = clampFontSize(nextValue);
-    setFontSize(next);
-    if (activeNovel) {
-      updateNovelById(activeNovel.id, (novel) => ({
-        ...novel,
-        fontSize: next,
-        updatedAt: Date.now()
-      }));
-      queueAutoSync();
-    }
-  }
-
-  function applyLineHeight(nextValue) {
-    const next = clampLineHeight(nextValue);
-    setLineHeight(next);
-    if (activeNovel) {
-      updateNovelById(activeNovel.id, (novel) => ({
-        ...novel,
-        lineHeight: next,
-        updatedAt: Date.now()
-      }));
-      queueAutoSync();
-    }
-  }
-
-  function queueAutoSync() {
-    const config = getSyncConfig();
-    if (!config.isConfigured || syncingSuppressedRef.current) return;
-    window.clearTimeout(syncTimerRef.current);
-    syncTimerRef.current = window.setTimeout(() => {
-      void syncWithSupabase();
-    }, 700);
-  }
-
-  function flushPendingSaves() {
-    clearPendingTimers();
-    const snapshot = persistSnapshotToStorage();
-    saveCurrentNovelFromReader();
-    return snapshot;
-  }
-
-  function buildCurrentSnapshot() {
-    if (!activeNovel || !readerRef.current) {
-      return { nextNovels: novels, nextActiveNovelId: activeNovelId };
+  function buildReaderSnapshot() {
+    if (!activeBook || !readerRef.current) {
+      return { nextBooks: books, nextActiveBookId: activeBookId };
     }
 
     const content = normalizeText(readerRef.current.innerText || "");
     const now = Date.now();
-    const nextNovels = novels.map((novel) =>
-      novel.id === activeNovel.id
-        ? {
-            ...novel,
-            title: (titleInput || novel.title || "Untitled Novel").trim(),
-            content,
-            scrollTop: readerRef.current.scrollTop,
-            fontSize,
-            lineHeight,
-            updatedAt: now
-          }
-        : novel
-    );
 
     return {
-      nextNovels,
-      nextActiveNovelId: activeNovelId
+      nextBooks: books.map((book) =>
+        book.id === activeBook.id
+          ? {
+              ...book,
+              content,
+              scrollTop: readerRef.current.scrollTop,
+              fontSize,
+              lineHeight,
+              updatedAt: now
+            }
+          : book
+      ),
+      nextActiveBookId: activeBookId
     };
   }
 
-  function persistSnapshotToStorage() {
-    const snapshot = buildCurrentSnapshot();
-    void persistLibrarySnapshot(snapshot.nextNovels, snapshot.nextActiveNovelId);
-    return snapshot;
+  function flushPendingSaves() {
+    clearTimers();
+    if (!activeBook) return;
+    const snapshot = buildReaderSnapshot();
+    commitLibrary(snapshot.nextBooks, snapshot.nextActiveBookId);
   }
 
-  function saveCurrentNovelFromReader() {
-    if (!activeNovel || !readerRef.current) return;
-    const snapshot = buildCurrentSnapshot();
-    void commitLibraryState(snapshot.nextNovels, snapshot.nextActiveNovelId);
-    queueAutoSync();
-  }
-
-  function queueSave() {
-    window.clearTimeout(saveTimerRef.current);
+  function queueReaderSave() {
+    clearTimers();
     saveTimerRef.current = window.setTimeout(() => {
-      saveCurrentNovelFromReader();
-    }, 180);
+      const snapshot = buildReaderSnapshot();
+      commitLibrary(snapshot.nextBooks, snapshot.nextActiveBookId);
+    }, 150);
   }
 
   function queueScrollSave() {
     window.clearTimeout(scrollTimerRef.current);
     scrollTimerRef.current = window.setTimeout(() => {
-      if (!activeNovel || !readerRef.current) return;
-      updateNovelById(activeNovel.id, (novel) => ({
-        ...novel,
-        scrollTop: readerRef.current.scrollTop,
-        updatedAt: Date.now()
-      }));
-      queueAutoSync();
+      const snapshot = buildReaderSnapshot();
+      commitLibrary(snapshot.nextBooks, snapshot.nextActiveBookId);
     }, 120);
   }
 
-  function ensureActiveNovel() {
-    if (activeNovel) return activeNovel;
-    const novel = createNovel((titleInput || "").trim() || `Novel ${novels.length + 1}`);
-    novel.fontSize = fontSize;
-    novel.lineHeight = lineHeight;
-    commitLibraryState([...novels, novel], novel.id);
-    return novel;
-  }
+  function handleCreateNew() {
+    const title = draftTitle.trim();
+    if (!title) return;
 
-  function showLibraryView() {
+    const book = createBook(title);
+    commitLibrary([...books, book], book.id);
+    setDraftTitle("");
+    setSearchQuery("");
+    setSelectedSuggestionIndex(-1);
     setViewMode("library");
-    setShowChrome(false);
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
   }
 
-  function openNovel(id, { updateHash = true, skipFlush = false } = {}) {
-    if (!skipFlush) {
-      flushPendingSaves();
+  function handleSave() {
+    if (viewMode === "library" && draftTitle.trim()) {
+      handleCreateNew();
+      return;
     }
-    setActiveNovelId(id);
+
+    flushPendingSaves();
+  }
+
+  function openBook(bookId) {
+    flushPendingSaves();
+    setActiveBookId(bookId);
     setViewMode("reader");
     setShowChrome(false);
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
-
-    if (updateHash && window.location.hash !== buildReaderHash(id)) {
-      window.location.hash = buildReaderHash(id);
+    if (window.location.hash !== buildReaderHash(bookId)) {
+      window.location.hash = buildReaderHash(bookId);
     }
-  }
-
-  function handleOpenNovel(id) {
-    openNovel(id);
   }
 
   function handleBackToLibrary() {
     flushPendingSaves();
-    if (getNovelIdFromHash()) {
+    if (getBookIdFromHash()) {
       window.history.back();
       return;
     }
 
-    showLibraryView();
+    setViewMode("library");
+    setShowChrome(false);
   }
 
-  function handleNewNovel() {
-    flushPendingSaves();
-    const title = (titleInput || "").trim() || `Novel ${novels.length + 1}`;
-    const novel = createNovel(title);
-    void commitLibraryState([...novels, novel], novel.id);
-    if (readerRef.current) {
-      readerRef.current.innerHTML = "";
-      readerRef.current.scrollTop = 0;
-    }
-    previousRenderedNovelIdRef.current = null;
-    openNovel(novel.id, { skipFlush: true });
-    updatePageMetrics();
-  }
+  function handleDeleteBook(bookId) {
+    const book = books.find((entry) => entry.id === bookId);
+    if (!book) return;
 
-  function handleDeleteNovel(id) {
-    const novelToDelete = novels.find((novel) => novel.id === id);
-    if (!novelToDelete) return;
-
-    const confirmed = window.confirm(`Delete "${novelToDelete.title || "Untitled Novel"}"?`);
+    const confirmed = window.confirm(`Delete "${book.title || "Untitled Book"}"?`);
     if (!confirmed) return;
 
-    clearPendingTimers();
-    const snapshot = activeNovelId === id ? { nextNovels: novels, nextActiveNovelId: activeNovelId } : buildCurrentSnapshot();
-    const nextNovels = snapshot.nextNovels.filter((novel) => novel.id !== id);
-    const nextActiveNovelId = activeNovelId === id ? null : activeNovelId;
-    const nextDeletedNovelIds = Array.from(new Set([...deletedNovelIdsRef.current, id]));
+    clearTimers();
+    const snapshot = buildReaderSnapshot();
+    const nextBooks = snapshot.nextBooks.filter((entry) => entry.id !== bookId);
+    const deletingActive = activeBookId === bookId;
 
-    persistDeletedNovelIds(nextDeletedNovelIds);
-    void commitLibraryState(nextNovels, nextActiveNovelId);
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+    commitLibrary(nextBooks, deletingActive ? null : snapshot.nextActiveBookId);
 
-    if (activeNovelId === id) {
-      showLibraryView();
-      window.location.hash = "";
-      setTitleInput("");
+    if (deletingActive) {
+      setViewMode("library");
+      setShowChrome(false);
+      if (window.location.hash) {
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      }
       if (readerRef.current) {
         readerRef.current.innerHTML = "";
         readerRef.current.scrollTop = 0;
       }
-      previousRenderedNovelIdRef.current = null;
+      previousRenderedBookIdRef.current = null;
       updatePageMetrics();
     }
-
-    queueAutoSync();
   }
 
-  function handleRenameNovel(id) {
-    const novelToRename = novels.find((novel) => novel.id === id);
-    if (!novelToRename) return;
+  function handleRenameBook(bookId) {
+    const book = books.find((entry) => entry.id === bookId);
+    if (!book) return;
 
-    const nextTitle = window.prompt("Edit book title", novelToRename.title || "Untitled Novel");
+    const nextTitle = window.prompt("Edit book title", book.title || "Untitled Book");
     if (nextTitle == null) return;
 
-    const trimmedTitle = nextTitle.trim() || "Untitled Novel";
-    const nextNovels = novels.map((novel) =>
-      novel.id === id
-        ? {
-            ...novel,
-            title: trimmedTitle,
-            updatedAt: Date.now()
-          }
-        : novel
+    const trimmedTitle = nextTitle.trim() || "Untitled Book";
+    commitLibrary(
+      books.map((entry) =>
+        entry.id === bookId
+          ? {
+              ...entry,
+              title: trimmedTitle,
+              updatedAt: Date.now()
+            }
+          : entry
+      ),
+      activeBookId
     );
-    void commitLibraryState(nextNovels, activeNovelId);
-
-    if (activeNovelId === id) {
-      setTitleInput(trimmedTitle);
-    }
-
-    queueAutoSync();
   }
 
-  function handleSaveNovel() {
-    const title = (titleInput || "").trim() || "Untitled Novel";
-    if (!activeNovel) {
-      const novel = createNovel(title);
-      novel.content = normalizeText(readerRef.current?.innerText || "");
-      novel.fontSize = fontSize;
-      novel.lineHeight = lineHeight;
-      void commitLibraryState([...novels, novel], novel.id);
-      queueAutoSync();
-      return;
-    }
+  function applyFontSize(nextValue) {
+    const next = clampFontSize(nextValue);
+    setFontSize(next);
+    if (!activeBook) return;
 
-    saveCurrentNovelFromReader();
-    const nextNovels = novels.map((novel) =>
-      novel.id === activeNovel.id
-        ? {
-            ...novel,
-            title,
-            updatedAt: Date.now()
-          }
-        : novel
+    commitLibrary(
+      books.map((book) =>
+        book.id === activeBook.id
+          ? {
+              ...book,
+              fontSize: next,
+              updatedAt: Date.now()
+            }
+          : book
+      ),
+      activeBook.id
     );
-    void commitLibraryState(nextNovels, activeNovel.id);
-    queueAutoSync();
   }
 
-  function handleTitleChange(value) {
-    setTitleInput(value);
-    if (!activeNovel) return;
-    const nextNovels = novels.map((novel) =>
-      novel.id === activeNovel.id
-        ? {
-            ...novel,
-            title: (value || novel.title || "Untitled Novel").trim(),
-            updatedAt: Date.now()
-          }
-        : novel
+  function applyLineHeight(nextValue) {
+    const next = clampLineHeight(nextValue);
+    setLineHeight(next);
+    if (!activeBook) return;
+
+    commitLibrary(
+      books.map((book) =>
+        book.id === activeBook.id
+          ? {
+              ...book,
+              lineHeight: next,
+              updatedAt: Date.now()
+            }
+          : book
+      ),
+      activeBook.id
     );
-    void commitLibraryState(nextNovels, activeNovel.id);
-    queueAutoSync();
-  }
-
-  function handleReaderInput() {
-    const novel = ensureActiveNovel();
-    if (!novel) return;
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
-    updateNovelById(novel.id, (current) => ({
-      ...current,
-      updatedAt: Date.now()
-    }));
-    queueSave();
-    updatePageMetrics();
-  }
-
-  function handleReaderPaste(event) {
-    event.preventDefault();
-    const text = normalizeText(event.clipboardData?.getData("text/plain") || "");
-    if (!text) return;
-
-    const selection = window.getSelection();
-    if (!selection || selection.rangeCount === 0) {
-      document.execCommand("insertText", false, text);
-    } else {
-      selection.deleteFromDocument();
-      selection.getRangeAt(0).insertNode(document.createTextNode(text));
-      selection.collapseToEnd();
-    }
-    handleReaderInput();
-  }
-
-  function applyHighlightFromMenu() {
-    const reader = readerRef.current;
-    const novel = ensureActiveNovel();
-    if (!reader || !novel || !highlightMenu.visible) return;
-
-    const nextHighlight = {
-      start: highlightMenu.start,
-      end: highlightMenu.end
-    };
-
-    const nextNovels = novels.map((entry) =>
-      entry.id === novel.id
-        ? {
-            ...entry,
-            content: highlightMenu.content || normalizeText(reader.innerText || ""),
-            highlight: nextHighlight,
-            scrollTop: reader.scrollTop,
-            fontSize,
-            lineHeight,
-            updatedAt: Date.now()
-          }
-        : entry
-    );
-    commitLibraryState(nextNovels, novel.id);
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
-    queueAutoSync();
-  }
-
-  function openSettings() {
-    const settings = getSettingsWithDeviceId();
-    setSupabaseUrlInput(settings.supabaseUrl || "");
-    setSupabaseAnonKeyInput(settings.supabaseAnonKey || "");
-    setSettingsStatus(settings.lastSyncMessage || "");
-    setSettingsOpen(true);
-  }
-
-  function serializeNovelForSync(novel, config) {
-    return {
-      id: novel.id,
-      user_id: config.deviceId,
-      title: novel.title || "Untitled Novel",
-      content: novel.content || "",
-      scroll_top: Math.max(0, Math.floor(novel.scrollTop || 0)),
-      highlight_start: novel.highlight?.start ?? null,
-      highlight_end: novel.highlight?.end ?? null,
-      font_size: clampFontSize(parseInt(String(novel.fontSize || 17), 10)),
-      line_height: clampLineHeight(parseFloat(String(novel.lineHeight || 1.35))),
-      is_active: novel.id === activeNovelId,
-      client_updated_at: new Date(novel.updatedAt || Date.now()).toISOString()
-    };
-  }
-
-  function applyRemoteNovels(rows) {
-    setNovels((current) => {
-      const byId = new Map(current.map((novel) => [novel.id, novel]));
-      let nextActiveNovelId = activeNovelId;
-
-      rows.forEach((row) => {
-        if (deletedNovelIdsRef.current.includes(row.id)) return;
-        const remoteTime = Date.parse(row.client_updated_at || row.updated_at || 0);
-        const local = byId.get(row.id);
-        if (local && (local.updatedAt || 0) > remoteTime) return;
-
-        byId.set(row.id, {
-          id: row.id,
-          title: row.title || "Untitled Novel",
-          content: row.content || "",
-          scrollTop: row.scroll_top || 0,
-          highlight:
-            row.highlight_start == null || row.highlight_end == null
-              ? null
-              : { start: row.highlight_start, end: row.highlight_end },
-          fontSize: clampFontSize(parseInt(String(row.font_size || 17), 10)),
-          lineHeight: clampLineHeight(parseFloat(String(row.line_height || 1.35))),
-          updatedAt: remoteTime || Date.now()
-        });
-
-        if (row.is_active) {
-          nextActiveNovelId = row.id;
-        }
-      });
-
-      if (nextActiveNovelId !== activeNovelId) {
-        setActiveNovelId(nextActiveNovelId);
-      }
-      return Array.from(byId.values());
-    });
-  }
-
-  async function pullFromSupabase(config) {
-    const url = `${config.supabaseUrl}/rest/v1/reader_novels?user_id=eq.${encodeURIComponent(config.deviceId)}&select=*`;
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        apikey: config.supabaseAnonKey,
-        Authorization: `Bearer ${config.supabaseAnonKey}`
-      }
-    });
-    if (!response.ok) {
-      const details = await response.text();
-      throw new Error(`Pull failed (${response.status})${details ? `: ${details}` : ""}`);
-    }
-    const rows = await response.json();
-    applyRemoteNovels(Array.isArray(rows) ? rows : []);
-  }
-
-  async function pushToSupabase(config, sourceNovels) {
-    if (sourceNovels.length === 0) return;
-    const payload = sourceNovels.map((novel) => serializeNovelForSync(novel, config));
-    const response = await fetch(`${config.supabaseUrl}/rest/v1/reader_novels`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Prefer: "resolution=merge-duplicates",
-        apikey: config.supabaseAnonKey,
-        Authorization: `Bearer ${config.supabaseAnonKey}`
-      },
-      body: JSON.stringify(payload)
-    });
-    if (!response.ok) {
-      const details = await response.text();
-      throw new Error(`Push failed (${response.status})${details ? `: ${details}` : ""}`);
-    }
-  }
-
-  async function deleteFromSupabase(config, novelIds) {
-    if (novelIds.length === 0) return;
-
-    const inFilter = novelIds.map((id) => `"${id.replace(/"/g, '\\"')}"`).join(",");
-    const url = `${config.supabaseUrl}/rest/v1/reader_novels?user_id=eq.${encodeURIComponent(config.deviceId)}&id=in.(${inFilter})`;
-    const response = await fetch(url, {
-      method: "DELETE",
-      headers: {
-        Prefer: "return=minimal",
-        apikey: config.supabaseAnonKey,
-        Authorization: `Bearer ${config.supabaseAnonKey}`
-      }
-    });
-
-    if (!response.ok) {
-      const details = await response.text();
-      throw new Error(`Delete failed (${response.status})${details ? `: ${details}` : ""}`);
-    }
-  }
-
-  async function syncWithSupabase({ manual = false } = {}) {
-    const config = getSyncConfig();
-    if (!config.isConfigured) {
-      if (manual) {
-        setSettingsStatus("Enter the Supabase URL and anon key first.");
-      }
-      return;
-    }
-
-    if (syncInFlightRef.current) return;
-    syncInFlightRef.current = true;
-
-    try {
-      const snapshot = flushPendingSaves();
-      await pushToSupabase(config, snapshot.nextNovels);
-      await deleteFromSupabase(config, deletedNovelIdsRef.current);
-      syncingSuppressedRef.current = true;
-      await pullFromSupabase(config);
-      syncingSuppressedRef.current = false;
-
-      const message = `Last synced ${new Date().toLocaleString()}`;
-      setSettingsStatus(message);
-      saveAppSettings({
-        ...getSettingsWithDeviceId(),
-        supabaseUrl: config.supabaseUrl,
-        supabaseAnonKey: config.supabaseAnonKey,
-        lastSyncMessage: message,
-        deletedNovelIds: []
-      });
-      deletedNovelIdsRef.current = [];
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "Sync failed";
-      setSettingsStatus(message);
-    } finally {
-      syncingSuppressedRef.current = false;
-      syncInFlightRef.current = false;
-    }
   }
 
   return (
@@ -953,26 +478,26 @@ export default function App() {
         "--line-height": lineHeight
       }}
     >
-      <aside className="library-pane" aria-label="Novel library">
+      <aside className="library-pane" aria-label="Book library">
         <div className="library-header">
-          <h1>Novels</h1>
+          <h1>Books</h1>
         </div>
 
         <div className="library-actions">
           <input
             className="input"
             type="text"
-            placeholder="Novel title"
-            aria-label="Novel title"
-            value={titleInput}
-            onChange={(event) => handleTitleChange(event.target.value)}
+            placeholder="Book title"
+            aria-label="Book title"
+            value={draftTitle}
+            onChange={(event) => setDraftTitle(event.target.value)}
           />
           <div className="action-row">
-            <button className="action-button" type="button" onClick={handleNewNovel}>
+            <button className="action-button" type="button" onClick={() => setDraftTitle("")}>
               New
             </button>
-            <button className="action-button primary" type="button" onClick={handleSaveNovel}>
-              Save2
+            <button className="action-button primary" type="button" onClick={handleSave}>
+              Save3
             </button>
           </div>
         </div>
@@ -981,8 +506,8 @@ export default function App() {
           <input
             className="input"
             type="search"
-            placeholder="Search novels"
-            aria-label="Search novels"
+            placeholder="Search books"
+            aria-label="Search books"
             autoComplete="off"
             value={searchQuery}
             onFocus={() => setSelectedSuggestionIndex(-1)}
@@ -991,10 +516,10 @@ export default function App() {
               setSelectedSuggestionIndex(-1);
             }}
             onKeyDown={(event) => {
-              if (!searchQuery.trim() || matchingNovels.length === 0) return;
+              if (!searchQuery.trim() || matchingBooks.length === 0) return;
               if (event.key === "ArrowDown") {
                 event.preventDefault();
-                setSelectedSuggestionIndex((current) => Math.min(matchingNovels.length - 1, current + 1));
+                setSelectedSuggestionIndex((current) => Math.min(matchingBooks.length - 1, current + 1));
               }
               if (event.key === "ArrowUp") {
                 event.preventDefault();
@@ -1002,28 +527,26 @@ export default function App() {
               }
               if (event.key === "Enter") {
                 event.preventDefault();
-                const match = matchingNovels[selectedSuggestionIndex] || matchingNovels[0];
+                const match = matchingBooks[selectedSuggestionIndex] || matchingBooks[0];
                 if (match) {
-                  setSearchQuery(match.title || "");
-                  handleOpenNovel(match.id);
+                  openBook(match.id);
                 }
               }
             }}
           />
-          {searchQuery.trim() && matchingNovels.length > 0 ? (
-            <div className="search-suggestions" aria-label="Novel suggestions">
-              {matchingNovels.map((novel, index) => (
+          {searchQuery.trim() && matchingBooks.length > 0 ? (
+            <div className="search-suggestions" aria-label="Book suggestions">
+              {matchingBooks.map((book, index) => (
                 <button
-                  key={novel.id}
+                  key={book.id}
                   type="button"
                   className={`search-suggestion${index === selectedSuggestionIndex ? " active" : ""}`}
                   onMouseDown={(event) => {
                     event.preventDefault();
-                    setSearchQuery(novel.title || "");
-                    handleOpenNovel(novel.id);
+                    openBook(book.id);
                   }}
                 >
-                  {novel.title || "Untitled Novel"}
+                  {book.title || "Untitled Book"}
                 </button>
               ))}
             </div>
@@ -1031,28 +554,24 @@ export default function App() {
         </div>
 
         <div className="library-list">
-          <button type="button" className="novel-card settings-card" onClick={openSettings}>
-            <span className="novel-card-title">Settings</span>
-          </button>
+          {sortedBooks.length === 0 ? <div className="empty-state">{isReady ? "" : "Loading books..."}</div> : null}
 
-          {sortedNovels.length === 0 ? <div className="empty-state">{isLibraryReady ? "" : "Loading books..."}</div> : null}
-
-          {sortedNovels.map((novel) => (
-            <div key={novel.id} className={`novel-card-shell${novel.id === activeNovelId ? " active" : ""}`}>
+          {sortedBooks.map((book) => (
+            <div key={book.id} className="novel-card-shell">
               <button
                 type="button"
-                className={`novel-card${novel.id === activeNovelId ? " active" : ""}`}
-                onClick={() => handleOpenNovel(novel.id)}
+                className={`novel-card${book.id === activeBookId ? " active" : ""}`}
+                onClick={() => openBook(book.id)}
               >
-                <span className="novel-card-title">{novel.title || "Untitled Novel"}</span>
+                <span className="novel-card-title">{book.title || "Untitled Book"}</span>
               </button>
               <button
                 type="button"
                 className="rename-book-button"
-                aria-label={`Rename ${novel.title || "Untitled Novel"}`}
+                aria-label={`Rename ${book.title || "Untitled Book"}`}
                 onClick={(event) => {
                   event.stopPropagation();
-                  handleRenameNovel(novel.id);
+                  handleRenameBook(book.id);
                 }}
               >
                 Edit
@@ -1060,10 +579,10 @@ export default function App() {
               <button
                 type="button"
                 className="delete-book-button"
-                aria-label={`Delete ${novel.title || "Untitled Novel"}`}
+                aria-label={`Delete ${book.title || "Untitled Book"}`}
                 onClick={(event) => {
                   event.stopPropagation();
-                  handleDeleteNovel(novel.id);
+                  handleDeleteBook(book.id);
                 }}
               >
                 Delete
@@ -1145,23 +664,26 @@ export default function App() {
           suppressContentEditableWarning
           spellCheck="false"
           aria-label="Reading area"
-          onInput={handleReaderInput}
-          onPaste={handleReaderPaste}
-          onContextMenu={(event) => {
-            const range = getSelectionHighlightRange();
-            if (!range) {
-              setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
-              return;
-            }
+          onInput={() => {
+            queueReaderSave();
+            updatePageMetrics();
+          }}
+          onPaste={(event) => {
             event.preventDefault();
-            setHighlightMenu({
-              visible: true,
-              x: event.clientX,
-              y: event.clientY,
-              start: range.start,
-              end: range.end,
-              content: range.content
-            });
+            const text = normalizeText(event.clipboardData?.getData("text/plain") || "");
+            if (!text) return;
+
+            const selection = window.getSelection();
+            if (!selection || selection.rangeCount === 0) {
+              document.execCommand("insertText", false, text);
+            } else {
+              selection.deleteFromDocument();
+              selection.getRangeAt(0).insertNode(document.createTextNode(text));
+              selection.collapseToEnd();
+            }
+
+            queueReaderSave();
+            updatePageMetrics();
           }}
           onScroll={() => {
             updatePageMetrics();
@@ -1169,73 +691,10 @@ export default function App() {
           }}
         />
 
-        {highlightMenu.visible ? (
-          <button
-            type="button"
-            className="highlight-menu"
-            style={{ left: highlightMenu.x, top: highlightMenu.y }}
-            onClick={applyHighlightFromMenu}
-          >
-            Highlight
-          </button>
-        ) : null}
-
         <div className="page-counter" id="pageCounter">
           Page {pageMetrics.current} of {pageMetrics.total}
         </div>
       </main>
-
-      <div
-        className={`settings-overlay${settingsOpen ? " open" : ""}`}
-        aria-hidden={settingsOpen ? "false" : "true"}
-        onClick={(event) => {
-          if (event.target === event.currentTarget) {
-            setSettingsOpen(false);
-          }
-        }}
-      >
-        <div className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
-          <h2 id="settingsTitle">Settings</h2>
-          <div className="settings-grid">
-            <label className="settings-label">
-              <span>Supabase URL</span>
-              <input
-                className="input"
-                type="url"
-                placeholder="https://your-project.supabase.co"
-                value={supabaseUrlInput}
-                onChange={(event) => setSupabaseUrlInput(event.target.value)}
-              />
-            </label>
-            <label className="settings-label">
-              <span>Supabase Anon Key</span>
-              <input
-                className="input"
-                type="text"
-                placeholder="Paste anon key"
-                value={supabaseAnonKeyInput}
-                onChange={(event) => setSupabaseAnonKeyInput(event.target.value)}
-              />
-            </label>
-          </div>
-          <div className="settings-actions">
-            <button className="action-button" type="button" onClick={() => setSettingsOpen(false)}>
-              Close
-            </button>
-            <button
-              className="action-button primary"
-              type="button"
-              onClick={async () => {
-                setSettingsStatus("Syncing...");
-                await syncWithSupabase({ manual: true });
-              }}
-            >
-              Sync
-            </button>
-          </div>
-          <div className="settings-status">{settingsStatus}</div>
-        </div>
-      </div>
     </div>
   );
 }
