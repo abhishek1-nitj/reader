@@ -206,7 +206,7 @@ input {
 
 .novel-card-shell {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: stretch;
 }
@@ -229,6 +229,7 @@ input {
   background: linear-gradient(180deg, rgba(84, 107, 87, 0.18), rgba(255, 249, 239, 0.96));
 }
 
+.rename-book-button,
 .delete-book-button {
   padding: 0 12px;
   border: 1px solid rgba(126, 84, 69, 0.24);
@@ -238,6 +239,7 @@ input {
   cursor: pointer;
 }
 
+.rename-book-button:hover,
 .delete-book-button:hover {
   background: rgba(141, 93, 78, 0.14);
 }

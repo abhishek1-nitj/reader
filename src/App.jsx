@@ -6,6 +6,7 @@ const LIBRARY_DB_NAME = "reader-library-db";
 const LIBRARY_STORE_NAME = "reader-library-store";
 const LIBRARY_RECORD_KEY = "library-state";
 const CHROME_REVEAL_HEIGHT = 90;
+const IMPORT_STATUS_TIMEOUT_MS = 5000;
 const MIN_SIZE = 14;
 const MAX_SIZE = 72;
 const MIN_LINE_HEIGHT = 1;
@@ -300,6 +301,7 @@ export default function App() {
   const saveTimerRef = useRef(null);
   const scrollTimerRef = useRef(null);
   const syncTimerRef = useRef(null);
+  const importStatusTimerRef = useRef(null);
   const syncInFlightRef = useRef(false);
   const syncingSuppressedRef = useRef(false);
   const deletedNovelIdsRef = useRef(Array.isArray(initialSettings.deletedNovelIds) ? initialSettings.deletedNovelIds : []);
@@ -434,6 +436,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    window.clearTimeout(importStatusTimerRef.current);
+    if (!pdfImportStatus || isImportingPdf) return undefined;
+
+    importStatusTimerRef.current = window.setTimeout(() => {
+      setPdfImportStatus("");
+    }, IMPORT_STATUS_TIMEOUT_MS);
+
+    return () => {
+      window.clearTimeout(importStatusTimerRef.current);
+    };
+  }, [isImportingPdf, pdfImportStatus]);
+
+  useEffect(() => {
     const handlePointerDown = (event) => {
       if (event.target.closest(".highlight-menu")) return;
       setHighlightMenu((current) => (current.visible ? { visible: false, x: 0, y: 0, start: 0, end: 0, content: "" } : current));
@@ -448,10 +463,34 @@ export default function App() {
   useEffect(() => {
     if (!isLibraryReady) return;
     setViewMode("library");
+    window.history.replaceState({ viewMode: "library" }, "", window.location.href);
     if (getSyncConfig().isConfigured) {
       void syncWithSupabase();
     }
   }, [isLibraryReady]);
+
+  useEffect(() => {
+    if (!isLibraryReady) return undefined;
+
+    const handlePopState = (event) => {
+      const state = event.state;
+
+      if (state?.viewMode === "reader" && state.novelId) {
+        setActiveNovelId(state.novelId);
+        setViewMode("reader");
+      } else {
+        flushPendingSaves();
+        setViewMode("library");
+        setShowChrome(false);
+        setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+      }
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => {
+      window.removeEventListener("popstate", handlePopState);
+    };
+  }, [activeNovelId, isLibraryReady, novels]);
 
   function getSettingsWithDeviceId() {
     const settings = loadAppSettings();
@@ -667,10 +706,16 @@ export default function App() {
     setViewMode("reader");
     setShowChrome(false);
     setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+    window.history.pushState({ viewMode: "reader", novelId: id }, "", window.location.href);
   }
 
   function handleBackToLibrary() {
     flushPendingSaves();
+    if (window.history.state?.viewMode === "reader") {
+      window.history.back();
+      return;
+    }
+
     setViewMode("library");
     setShowChrome(false);
     setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
@@ -717,6 +762,28 @@ export default function App() {
       updatePageMetrics();
     }
 
+    queueAutoSync();
+  }
+
+  function handleRenameNovel(id) {
+    const novelToRename = novels.find((novel) => novel.id === id);
+    if (!novelToRename) return;
+
+    const nextTitle = window.prompt("Edit book title", novelToRename.title || "Untitled Novel");
+    if (nextTitle == null) return;
+
+    const trimmedTitle = nextTitle.trim() || "Untitled Novel";
+    updateNovelById(id, (novel) => ({
+      ...novel,
+      title: trimmedTitle,
+      updatedAt: Date.now()
+    }));
+
+    if (activeNovelId === id) {
+      setTitleInput(trimmedTitle);
+    }
+
+    setPdfImportStatus(`Renamed to "${trimmedTitle}".`);
     queueAutoSync();
   }
 
@@ -1161,6 +1228,14 @@ export default function App() {
                 onClick={() => handleOpenNovel(novel.id)}
               >
                 <span className="novel-card-title">{novel.title || "Untitled Novel"}</span>
+              </button>
+              <button
+                type="button"
+                className="rename-book-button"
+                aria-label={`Rename ${novel.title || "Untitled Novel"}`}
+                onClick={() => handleRenameNovel(novel.id)}
+              >
+                Edit
               </button>
               <button
                 type="button"
