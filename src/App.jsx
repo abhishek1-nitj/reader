@@ -2,6 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 
 const STORAGE_KEY = "reader-library-v1";
 const SETTINGS_KEY = "reader-settings-v1";
+const LIBRARY_DB_NAME = "reader-library-db";
+const LIBRARY_STORE_NAME = "reader-library-store";
+const LIBRARY_RECORD_KEY = "library-state";
 const CHROME_REVEAL_HEIGHT = 90;
 const MIN_SIZE = 14;
 const MAX_SIZE = 72;
@@ -65,6 +68,60 @@ function loadLibraryState() {
   } catch {
     return { novels: [], activeNovelId: null };
   }
+}
+
+let libraryDatabasePromise = null;
+
+function openLibraryDatabase() {
+  if (!libraryDatabasePromise) {
+    libraryDatabasePromise = new Promise((resolve, reject) => {
+      const request = window.indexedDB.open(LIBRARY_DB_NAME, 1);
+
+      request.onupgradeneeded = () => {
+        const database = request.result;
+        if (!database.objectStoreNames.contains(LIBRARY_STORE_NAME)) {
+          database.createObjectStore(LIBRARY_STORE_NAME);
+        }
+      };
+
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error || new Error("Unable to open IndexedDB."));
+    });
+  }
+
+  return libraryDatabasePromise;
+}
+
+async function readLibraryStateFromIndexedDb() {
+  const database = await openLibraryDatabase();
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(LIBRARY_STORE_NAME, "readonly");
+    const store = transaction.objectStore(LIBRARY_STORE_NAME);
+    const request = store.get(LIBRARY_RECORD_KEY);
+
+    request.onsuccess = () => {
+      const parsed = request.result;
+      resolve({
+        novels: Array.isArray(parsed?.novels) ? parsed.novels : [],
+        activeNovelId: typeof parsed?.activeNovelId === "string" ? parsed.activeNovelId : null
+      });
+    };
+    request.onerror = () => reject(request.error || new Error("Unable to read library from IndexedDB."));
+  });
+}
+
+async function writeLibraryStateToIndexedDb(nextState) {
+  const database = await openLibraryDatabase();
+
+  return new Promise((resolve, reject) => {
+    const transaction = database.transaction(LIBRARY_STORE_NAME, "readwrite");
+    const store = transaction.objectStore(LIBRARY_STORE_NAME);
+    store.put(nextState, LIBRARY_RECORD_KEY);
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error || new Error("Unable to save library to IndexedDB."));
+    transaction.onabort = () => reject(transaction.error || new Error("Saving library to IndexedDB was aborted."));
+  });
 }
 
 function loadAppSettings() {
@@ -217,10 +274,9 @@ function getTextOffset(root, node, nodeOffset) {
 }
 
 export default function App() {
-  const initialLibrary = useMemo(() => loadLibraryState(), []);
   const initialSettings = useMemo(() => loadAppSettings(), []);
-  const [novels, setNovels] = useState(initialLibrary.novels);
-  const [activeNovelId, setActiveNovelId] = useState(initialLibrary.activeNovelId);
+  const [novels, setNovels] = useState([]);
+  const [activeNovelId, setActiveNovelId] = useState(null);
   const [viewMode, setViewMode] = useState("library");
   const [titleInput, setTitleInput] = useState("");
   const [searchQuery, setSearchQuery] = useState("");
@@ -236,6 +292,7 @@ export default function App() {
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
   const [pdfImportStatus, setPdfImportStatus] = useState("");
   const [isImportingPdf, setIsImportingPdf] = useState(false);
+  const [isLibraryReady, setIsLibraryReady] = useState(false);
 
   const readerRef = useRef(null);
   const pdfInputRef = useRef(null);
@@ -245,6 +302,7 @@ export default function App() {
   const syncTimerRef = useRef(null);
   const syncInFlightRef = useRef(false);
   const syncingSuppressedRef = useRef(false);
+  const deletedNovelIdsRef = useRef(Array.isArray(initialSettings.deletedNovelIds) ? initialSettings.deletedNovelIds : []);
 
   const activeNovel = novels.find((novel) => novel.id === activeNovelId) || null;
 
@@ -260,14 +318,53 @@ export default function App() {
   }, [searchQuery, sortedNovels]);
 
   useEffect(() => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        novels,
-        activeNovelId
-      })
-    );
-  }, [novels, activeNovelId]);
+    let cancelled = false;
+
+    async function hydrateLibrary() {
+      try {
+        const indexedState = await readLibraryStateFromIndexedDb();
+        const legacyState = loadLibraryState();
+        const shouldMigrateLegacy = indexedState.novels.length === 0 && legacyState.novels.length > 0;
+        const nextState = shouldMigrateLegacy ? legacyState : indexedState;
+
+        if (shouldMigrateLegacy) {
+          await writeLibraryStateToIndexedDb(nextState);
+          localStorage.removeItem(STORAGE_KEY);
+        }
+
+        if (cancelled) return;
+        setNovels(nextState.novels);
+        setActiveNovelId(nextState.activeNovelId);
+      } catch (error) {
+        if (cancelled) return;
+        const legacyState = loadLibraryState();
+        setNovels(legacyState.novels);
+        setActiveNovelId(legacyState.activeNovelId);
+        setPdfImportStatus(error instanceof Error ? error.message : "Unable to load saved books.");
+      } finally {
+        if (!cancelled) {
+          setIsLibraryReady(true);
+        }
+      }
+    }
+
+    void hydrateLibrary();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isLibraryReady) return;
+
+    void writeLibraryStateToIndexedDb({
+      novels,
+      activeNovelId
+    }).catch((error) => {
+      setPdfImportStatus(error instanceof Error ? error.message : "Unable to save the library.");
+    });
+  }, [activeNovelId, isLibraryReady, novels]);
 
   useEffect(() => {
     saveAppSettings({
@@ -276,7 +373,8 @@ export default function App() {
       lineHeight,
       supabaseUrl: supabaseUrlInput.trim(),
       supabaseAnonKey: supabaseAnonKeyInput.trim(),
-      lastSyncMessage: settingsStatus
+      lastSyncMessage: settingsStatus,
+      deletedNovelIds: deletedNovelIdsRef.current
     });
   }, [fontSize, lineHeight, settingsStatus, supabaseUrlInput, supabaseAnonKeyInput]);
 
@@ -315,7 +413,7 @@ export default function App() {
 
     previousRenderedNovelIdRef.current = activeNovel?.id || null;
     updatePageMetrics();
-  }, [activeNovel?.id, activeNovel?.content, activeNovel?.highlight, activeNovel?.scrollTop]);
+  }, [activeNovel?.content, activeNovel?.highlight, activeNovel?.id]);
 
   useEffect(() => {
     const handleBeforeUnload = () => flushPendingSaves();
@@ -348,11 +446,12 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!isLibraryReady) return;
     setViewMode("library");
     if (getSyncConfig().isConfigured) {
       void syncWithSupabase();
     }
-  }, []);
+  }, [isLibraryReady]);
 
   function getSettingsWithDeviceId() {
     const settings = loadAppSettings();
@@ -392,15 +491,36 @@ export default function App() {
     );
   }
 
+  function persistLibrarySnapshot(nextNovels, nextActiveNovelId) {
+    if (!isLibraryReady) {
+      return Promise.resolve();
+    }
+
+    return writeLibraryStateToIndexedDb({
+      novels: nextNovels,
+      activeNovelId: nextActiveNovelId
+    }).catch((error) => {
+      setPdfImportStatus(error instanceof Error ? error.message : "Unable to save the library.");
+    });
+  }
+
+  function persistDeletedNovelIds(nextDeletedNovelIds) {
+    deletedNovelIdsRef.current = nextDeletedNovelIds;
+    saveAppSettings({
+      ...loadAppSettings(),
+      fontSize,
+      lineHeight,
+      supabaseUrl: supabaseUrlInput.trim(),
+      supabaseAnonKey: supabaseAnonKeyInput.trim(),
+      lastSyncMessage: settingsStatus,
+      deletedNovelIds: nextDeletedNovelIds
+    });
+  }
+
   function commitLibraryState(nextNovels, nextActiveNovelId = activeNovelId) {
     setNovels(nextNovels);
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        novels: nextNovels,
-        activeNovelId: nextActiveNovelId
-      })
-    );
+    setActiveNovelId(nextActiveNovelId);
+    void persistLibrarySnapshot(nextNovels, nextActiveNovelId);
   }
 
   function getSelectionHighlightRange() {
@@ -466,7 +586,7 @@ export default function App() {
     window.clearTimeout(saveTimerRef.current);
     window.clearTimeout(scrollTimerRef.current);
     window.clearTimeout(syncTimerRef.current);
-    const snapshot = persistSnapshotToLocalStorage();
+    const snapshot = persistSnapshotToStorage();
     saveCurrentNovelFromReader();
     return snapshot;
   }
@@ -498,15 +618,9 @@ export default function App() {
     };
   }
 
-  function persistSnapshotToLocalStorage() {
+  function persistSnapshotToStorage() {
     const snapshot = buildCurrentSnapshot();
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        novels: snapshot.nextNovels,
-        activeNovelId: snapshot.nextActiveNovelId
-      })
-    );
+    void persistLibrarySnapshot(snapshot.nextNovels, snapshot.nextActiveNovelId);
     return snapshot;
   }
 
@@ -576,7 +690,37 @@ export default function App() {
     updatePageMetrics();
   }
 
-  async function extractPdfBook(file) {
+  function handleDeleteNovel(id) {
+    const novelToDelete = novels.find((novel) => novel.id === id);
+    if (!novelToDelete) return;
+
+    const confirmed = window.confirm(`Delete "${novelToDelete.title || "Untitled Novel"}"?`);
+    if (!confirmed) return;
+
+    flushPendingSaves();
+    const nextNovels = novels.filter((novel) => novel.id !== id);
+    const nextActiveNovelId = activeNovelId === id ? null : activeNovelId;
+    const nextDeletedNovelIds = Array.from(new Set([...deletedNovelIdsRef.current, id]));
+
+    persistDeletedNovelIds(nextDeletedNovelIds);
+    commitLibraryState(nextNovels, nextActiveNovelId);
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+
+    if (activeNovelId === id) {
+      setViewMode("library");
+      setTitleInput("");
+      if (readerRef.current) {
+        readerRef.current.innerHTML = "";
+        readerRef.current.scrollTop = 0;
+      }
+      previousRenderedNovelIdRef.current = null;
+      updatePageMetrics();
+    }
+
+    queueAutoSync();
+  }
+
+  async function extractPdfBook(file, onProgress) {
     const { getDocument } = await loadPdfJs();
     const arrayBuffer = await file.arrayBuffer();
     const loadingTask = getDocument({
@@ -589,12 +733,19 @@ export default function App() {
     const metadata = await pdf.getMetadata().catch(() => null);
     const pages = [];
 
+    onProgress?.(`Reading 0 of ${pdf.numPages} pages...`);
+
     for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
       const page = await pdf.getPage(pageNumber);
       const textContent = await page.getTextContent();
       const pageText = extractPageText(textContent);
       if (pageText) {
         pages.push(pageText);
+      }
+
+      if (pageNumber === pdf.numPages || pageNumber % 20 === 0) {
+        onProgress?.(`Reading ${pageNumber} of ${pdf.numPages} pages...`);
+        await new Promise((resolve) => window.setTimeout(resolve, 0));
       }
     }
 
@@ -619,7 +770,9 @@ export default function App() {
     setPdfImportStatus(`Importing ${file.name}...`);
 
     try {
-      const importedBook = await extractPdfBook(file);
+      const importedBook = await extractPdfBook(file, (message) => {
+        setPdfImportStatus(`${file.name}: ${message}`);
+      });
       const novel = createNovel(importedBook.title);
       novel.title = importedBook.title;
       novel.content = importedBook.content;
@@ -828,6 +981,26 @@ export default function App() {
     }
   }
 
+  async function deleteFromSupabase(config, novelIds) {
+    if (novelIds.length === 0) return;
+
+    const inFilter = novelIds.map((id) => `"${id.replace(/"/g, '\\"')}"`).join(",");
+    const url = `${config.supabaseUrl}/rest/v1/reader_novels?user_id=eq.${encodeURIComponent(config.deviceId)}&id=in.(${inFilter})`;
+    const response = await fetch(url, {
+      method: "DELETE",
+      headers: {
+        Prefer: "return=minimal",
+        apikey: config.supabaseAnonKey,
+        Authorization: `Bearer ${config.supabaseAnonKey}`
+      }
+    });
+
+    if (!response.ok) {
+      const details = await response.text();
+      throw new Error(`Delete failed (${response.status})${details ? `: ${details}` : ""}`);
+    }
+  }
+
   async function syncWithSupabase({ manual = false } = {}) {
     const config = getSyncConfig();
     if (!config.isConfigured) {
@@ -843,6 +1016,7 @@ export default function App() {
     try {
       const snapshot = flushPendingSaves();
       await pushToSupabase(config, snapshot.nextNovels);
+      await deleteFromSupabase(config, deletedNovelIdsRef.current);
       syncingSuppressedRef.current = true;
       await pullFromSupabase(config);
       syncingSuppressedRef.current = false;
@@ -853,8 +1027,10 @@ export default function App() {
         ...getSettingsWithDeviceId(),
         supabaseUrl: config.supabaseUrl,
         supabaseAnonKey: config.supabaseAnonKey,
-        lastSyncMessage: message
+        lastSyncMessage: message,
+        deletedNovelIds: []
       });
+      deletedNovelIdsRef.current = [];
     } catch (error) {
       const message = error instanceof Error ? error.message : "Sync failed";
       setSettingsStatus(message);
@@ -889,7 +1065,7 @@ export default function App() {
             className="import-card"
             type="button"
             onClick={() => pdfInputRef.current?.click()}
-            disabled={isImportingPdf}
+            disabled={isImportingPdf || !isLibraryReady}
           >
             <span className="import-card-kicker">{isImportingPdf ? "Importing PDF" : "Attach PDF"}</span>
             <span className="import-card-title">
@@ -975,17 +1151,26 @@ export default function App() {
             <span className="novel-card-title">Settings</span>
           </button>
 
-          {sortedNovels.length === 0 ? <div className="empty-state" /> : null}
+          {sortedNovels.length === 0 ? <div className="empty-state">{isLibraryReady ? "" : "Loading books..."}</div> : null}
 
           {sortedNovels.map((novel) => (
-            <button
-              key={novel.id}
-              type="button"
-              className={`novel-card${novel.id === activeNovelId ? " active" : ""}`}
-              onClick={() => handleOpenNovel(novel.id)}
-            >
-              <span className="novel-card-title">{novel.title || "Untitled Novel"}</span>
-            </button>
+            <div key={novel.id} className={`novel-card-shell${novel.id === activeNovelId ? " active" : ""}`}>
+              <button
+                type="button"
+                className={`novel-card${novel.id === activeNovelId ? " active" : ""}`}
+                onClick={() => handleOpenNovel(novel.id)}
+              >
+                <span className="novel-card-title">{novel.title || "Untitled Novel"}</span>
+              </button>
+              <button
+                type="button"
+                className="delete-book-button"
+                aria-label={`Delete ${novel.title || "Untitled Novel"}`}
+                onClick={() => handleDeleteNovel(novel.id)}
+              >
+                Delete
+              </button>
+            </div>
           ))}
         </div>
       </aside>

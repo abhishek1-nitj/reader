@@ -204,6 +204,13 @@ input {
   overflow-y: auto;
 }
 
+.novel-card-shell {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
 .novel-card {
   width: 100%;
   padding: 14px;
@@ -220,6 +227,19 @@ input {
 .novel-card.active {
   border-color: rgba(48, 67, 52, 0.35);
   background: linear-gradient(180deg, rgba(84, 107, 87, 0.18), rgba(255, 249, 239, 0.96));
+}
+
+.delete-book-button {
+  padding: 0 12px;
+  border: 1px solid rgba(126, 84, 69, 0.24);
+  border-radius: 16px;
+  background: rgba(141, 93, 78, 0.08);
+  color: #704735;
+  cursor: pointer;
+}
+
+.delete-book-button:hover {
+  background: rgba(141, 93, 78, 0.14);
 }
 
 .novel-card-title {
