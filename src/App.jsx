@@ -476,13 +476,10 @@ export default function App() {
       const state = event.state;
 
       if (state?.viewMode === "reader" && state.novelId) {
-        setActiveNovelId(state.novelId);
-        setViewMode("reader");
+        openNovel(state.novelId, { pushHistory: false });
       } else {
         flushPendingSaves();
-        setViewMode("library");
-        setShowChrome(false);
-        setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+        showLibraryView();
       }
     };
 
@@ -490,7 +487,7 @@ export default function App() {
     return () => {
       window.removeEventListener("popstate", handlePopState);
     };
-  }, [activeNovelId, isLibraryReady, novels]);
+  }, [isLibraryReady]);
 
   function getSettingsWithDeviceId() {
     const settings = loadAppSettings();
@@ -528,6 +525,12 @@ export default function App() {
         return updater(novel);
       })
     );
+  }
+
+  function clearPendingTimers() {
+    window.clearTimeout(saveTimerRef.current);
+    window.clearTimeout(scrollTimerRef.current);
+    window.clearTimeout(syncTimerRef.current);
   }
 
   function persistLibrarySnapshot(nextNovels, nextActiveNovelId) {
@@ -622,9 +625,7 @@ export default function App() {
   }
 
   function flushPendingSaves() {
-    window.clearTimeout(saveTimerRef.current);
-    window.clearTimeout(scrollTimerRef.current);
-    window.clearTimeout(syncTimerRef.current);
+    clearPendingTimers();
     const snapshot = persistSnapshotToStorage();
     saveCurrentNovelFromReader();
     return snapshot;
@@ -666,7 +667,7 @@ export default function App() {
   function saveCurrentNovelFromReader() {
     if (!activeNovel || !readerRef.current) return;
     const snapshot = buildCurrentSnapshot();
-    setNovels(snapshot.nextNovels);
+    commitLibraryState(snapshot.nextNovels, snapshot.nextActiveNovelId);
     queueAutoSync();
   }
 
@@ -695,18 +696,30 @@ export default function App() {
     const novel = createNovel((titleInput || "").trim() || `Novel ${novels.length + 1}`);
     novel.fontSize = fontSize;
     novel.lineHeight = lineHeight;
-    setNovels((current) => [...current, novel]);
-    setActiveNovelId(novel.id);
+    commitLibraryState([...novels, novel], novel.id);
     return novel;
   }
 
-  function handleOpenNovel(id) {
+  function showLibraryView() {
+    setViewMode("library");
+    setShowChrome(false);
+    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+  }
+
+  function openNovel(id, { pushHistory = true } = {}) {
     flushPendingSaves();
     setActiveNovelId(id);
     setViewMode("reader");
     setShowChrome(false);
     setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
-    window.history.pushState({ viewMode: "reader", novelId: id }, "", window.location.href);
+
+    if (pushHistory) {
+      window.history.pushState({ viewMode: "reader", novelId: id }, "", window.location.href);
+    }
+  }
+
+  function handleOpenNovel(id) {
+    openNovel(id);
   }
 
   function handleBackToLibrary() {
@@ -716,9 +729,7 @@ export default function App() {
       return;
     }
 
-    setViewMode("library");
-    setShowChrome(false);
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+    showLibraryView();
   }
 
   function handleNewNovel() {
@@ -730,8 +741,7 @@ export default function App() {
       readerRef.current.scrollTop = 0;
     }
     previousRenderedNovelIdRef.current = null;
-    setViewMode("library");
-    setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+    showLibraryView();
     updatePageMetrics();
   }
 
@@ -742,8 +752,9 @@ export default function App() {
     const confirmed = window.confirm(`Delete "${novelToDelete.title || "Untitled Novel"}"?`);
     if (!confirmed) return;
 
-    flushPendingSaves();
-    const nextNovels = novels.filter((novel) => novel.id !== id);
+    clearPendingTimers();
+    const snapshot = activeNovelId === id ? { nextNovels: novels, nextActiveNovelId: activeNovelId } : buildCurrentSnapshot();
+    const nextNovels = snapshot.nextNovels.filter((novel) => novel.id !== id);
     const nextActiveNovelId = activeNovelId === id ? null : activeNovelId;
     const nextDeletedNovelIds = Array.from(new Set([...deletedNovelIdsRef.current, id]));
 
@@ -752,7 +763,7 @@ export default function App() {
     setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
 
     if (activeNovelId === id) {
-      setViewMode("library");
+      showLibraryView();
       setTitleInput("");
       if (readerRef.current) {
         readerRef.current.innerHTML = "";
@@ -845,14 +856,15 @@ export default function App() {
       novel.content = importedBook.content;
       novel.updatedAt = Date.now();
 
-      setNovels((current) => [...current, novel]);
-      setActiveNovelId(novel.id);
+      const nextNovels = [...novels, novel];
+      commitLibraryState(nextNovels, novel.id);
       setTitleInput(novel.title);
-      setViewMode("reader");
       setSearchQuery("");
+      previousRenderedNovelIdRef.current = null;
+      window.history.pushState({ viewMode: "reader", novelId: novel.id }, "", window.location.href);
+      setViewMode("reader");
       setShowChrome(false);
       setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
-      previousRenderedNovelIdRef.current = null;
       setPdfImportStatus(`Imported "${novel.title}".`);
       queueAutoSync();
     } catch (error) {
