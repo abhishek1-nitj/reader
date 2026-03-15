@@ -6,26 +6,12 @@ const LIBRARY_DB_NAME = "reader-library-db";
 const LIBRARY_STORE_NAME = "reader-library-store";
 const LIBRARY_RECORD_KEY = "library-state";
 const CHROME_REVEAL_HEIGHT = 90;
-const IMPORT_STATUS_TIMEOUT_MS = 5000;
 const MIN_SIZE = 14;
 const MAX_SIZE = 72;
 const MIN_LINE_HEIGHT = 1;
 const MAX_LINE_HEIGHT = 2.4;
 const FONT_STEP = 1;
 const LINE_HEIGHT_STEP = 0.02;
-
-let pdfJsLoader = null;
-
-async function loadPdfJs() {
-  if (!pdfJsLoader) {
-    pdfJsLoader = import("pdfjs-dist").then((module) => {
-      module.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
-      return module;
-    });
-  }
-
-  return pdfJsLoader;
-}
 
 function normalizeText(text) {
   return text
@@ -162,111 +148,6 @@ function createNovel(title) {
   };
 }
 
-function cleanPdfTitle(value) {
-  if (typeof value !== "string") return "";
-  const title = normalizeText(value.replace(/\0/g, " ")).replace(/\s+/g, " ").trim();
-  if (!title) return "";
-
-  const lowered = title.toLowerCase();
-  if (["untitled", "microsoft word", "default", "document", "pdf"].includes(lowered)) {
-    return "";
-  }
-
-  return title.length > 160 ? title.slice(0, 160).trim() : title;
-}
-
-function titleFromFilename(filename) {
-  const base = (filename || "").replace(/\.pdf$/i, "");
-  return cleanPdfTitle(base.replace(/[_-]+/g, " "));
-}
-
-function inferTitleFromText(text) {
-  const candidates = normalizeText(text)
-    .split("\n")
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-
-  return (
-    candidates.find((line) => line.length >= 4 && line.length <= 120 && line.split(/\s+/).length <= 14) ||
-    candidates.find((line) => line.length <= 160) ||
-    ""
-  );
-}
-
-function derivePdfTitle(metadata, text, filename) {
-  const metadataTitle =
-    cleanPdfTitle(metadata?.info?.Title) ||
-    cleanPdfTitle(metadata?.metadata?.get?.("dc:title")) ||
-    cleanPdfTitle(metadata?.contentDispositionFilename);
-
-  return metadataTitle || cleanPdfTitle(inferTitleFromText(text)) || titleFromFilename(filename) || "Imported PDF";
-}
-
-function joinPdfLineSegments(segments) {
-  return segments.reduce((line, segment, index) => {
-    const text = segment.str.replace(/\s+/g, " ").trim();
-    if (!text) return line;
-    if (index === 0) return text;
-
-    const previous = segments[index - 1];
-    const previousText = previous.str.replace(/\s+/g, " ").trim();
-    const previousRight = Number(previous.transform?.[4] || 0) + Number(previous.width || 0);
-    const currentLeft = Number(segment.transform?.[4] || 0);
-    const gap = currentLeft - previousRight;
-    const needsSpace =
-      gap > 1.5 &&
-      !/[-/(\[]$/.test(previousText) &&
-      !/^[,.;:!?%)\]]/.test(text);
-
-    return `${line}${needsSpace ? " " : ""}${text}`;
-  }, "");
-}
-
-function extractPageText(textContent) {
-  const positionedItems = textContent.items
-    .filter((item) => typeof item?.str === "string" && item.str.trim())
-    .map((item) => ({
-      ...item,
-      y: Math.round(Number(item.transform?.[5] || 0) * 10) / 10,
-      x: Number(item.transform?.[4] || 0)
-    }));
-
-  if (positionedItems.length === 0) return "";
-
-  const linesByY = new Map();
-  positionedItems.forEach((item) => {
-    const key = String(item.y);
-    const existing = linesByY.get(key) || [];
-    existing.push(item);
-    linesByY.set(key, existing);
-  });
-
-  const lines = Array.from(linesByY.entries())
-    .map(([y, items]) => ({
-      y: Number(y),
-      text: joinPdfLineSegments(items.sort((a, b) => a.x - b.x))
-    }))
-    .filter((line) => line.text)
-    .sort((a, b) => b.y - a.y);
-
-  if (lines.length === 0) return "";
-
-  const gaps = [];
-  for (let index = 1; index < lines.length; index += 1) {
-    gaps.push(Math.abs(lines[index - 1].y - lines[index].y));
-  }
-  const sortedGaps = gaps.slice().sort((a, b) => a - b);
-  const baselineGap = sortedGaps[Math.floor(sortedGaps.length / 2)] || 12;
-
-  return lines
-    .map((line, index) => {
-      if (index === 0) return line.text;
-      const gap = Math.abs(lines[index - 1].y - line.y);
-      return `${gap > baselineGap * 1.45 ? "\n\n" : "\n"}${line.text}`;
-    })
-    .join("");
-}
-
 function getTextOffset(root, node, nodeOffset) {
   const range = document.createRange();
   range.selectNodeContents(root);
@@ -302,17 +183,13 @@ export default function App() {
   const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(initialSettings.supabaseAnonKey || "");
   const [settingsStatus, setSettingsStatus] = useState(initialSettings.lastSyncMessage || "");
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
-  const [pdfImportStatus, setPdfImportStatus] = useState("");
-  const [isImportingPdf, setIsImportingPdf] = useState(false);
   const [isLibraryReady, setIsLibraryReady] = useState(false);
 
   const readerRef = useRef(null);
-  const pdfInputRef = useRef(null);
   const previousRenderedNovelIdRef = useRef(null);
   const saveTimerRef = useRef(null);
   const scrollTimerRef = useRef(null);
   const syncTimerRef = useRef(null);
-  const importStatusTimerRef = useRef(null);
   const routeInitializedRef = useRef(false);
   const syncInFlightRef = useRef(false);
   const syncingSuppressedRef = useRef(false);
@@ -354,7 +231,7 @@ export default function App() {
         const legacyState = loadLibraryState();
         setNovels(legacyState.novels);
         setActiveNovelId(legacyState.activeNovelId);
-        setPdfImportStatus(error instanceof Error ? error.message : "Unable to load saved books.");
+        setSettingsStatus(error instanceof Error ? error.message : "Unable to load saved books.");
       } finally {
         if (!cancelled) {
           setIsLibraryReady(true);
@@ -376,7 +253,7 @@ export default function App() {
       novels,
       activeNovelId
     }).catch((error) => {
-      setPdfImportStatus(error instanceof Error ? error.message : "Unable to save the library.");
+      setSettingsStatus(error instanceof Error ? error.message : "Unable to save the library.");
     });
   }, [activeNovelId, isLibraryReady, novels]);
 
@@ -446,19 +323,6 @@ export default function App() {
       document.removeEventListener("visibilitychange", handleVisibility);
     };
   }, []);
-
-  useEffect(() => {
-    window.clearTimeout(importStatusTimerRef.current);
-    if (!pdfImportStatus || isImportingPdf) return undefined;
-
-    importStatusTimerRef.current = window.setTimeout(() => {
-      setPdfImportStatus("");
-    }, IMPORT_STATUS_TIMEOUT_MS);
-
-    return () => {
-      window.clearTimeout(importStatusTimerRef.current);
-    };
-  }, [isImportingPdf, pdfImportStatus]);
 
   useEffect(() => {
     const handlePointerDown = (event) => {
@@ -563,7 +427,7 @@ export default function App() {
       novels: nextNovels,
       activeNovelId: nextActiveNovelId
     }).catch((error) => {
-      setPdfImportStatus(error instanceof Error ? error.message : "Unable to save the library.");
+      setSettingsStatus(error instanceof Error ? error.message : "Unable to save the library.");
     });
   }
 
@@ -757,14 +621,15 @@ export default function App() {
 
   function handleNewNovel() {
     flushPendingSaves();
-    setActiveNovelId(null);
-    setTitleInput("");
+    const title = (titleInput || "").trim() || `Novel ${novels.length + 1}`;
+    const novel = createNovel(title);
+    void commitLibraryState([...novels, novel], novel.id);
     if (readerRef.current) {
       readerRef.current.innerHTML = "";
       readerRef.current.scrollTop = 0;
     }
     previousRenderedNovelIdRef.current = null;
-    showLibraryView();
+    openNovel(novel.id, { skipFlush: true });
     updatePageMetrics();
   }
 
@@ -782,12 +647,12 @@ export default function App() {
     const nextDeletedNovelIds = Array.from(new Set([...deletedNovelIdsRef.current, id]));
 
     persistDeletedNovelIds(nextDeletedNovelIds);
-    commitLibraryState(nextNovels, nextActiveNovelId);
+    void commitLibraryState(nextNovels, nextActiveNovelId);
     setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
 
     if (activeNovelId === id) {
       showLibraryView();
-      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+      window.location.hash = "";
       setTitleInput("");
       if (readerRef.current) {
         readerRef.current.innerHTML = "";
@@ -823,82 +688,7 @@ export default function App() {
       setTitleInput(trimmedTitle);
     }
 
-    setPdfImportStatus(`Renamed to "${trimmedTitle}".`);
     queueAutoSync();
-  }
-
-  async function extractPdfBook(file, onProgress) {
-    const { getDocument } = await loadPdfJs();
-    const arrayBuffer = await file.arrayBuffer();
-    const loadingTask = getDocument({
-      data: arrayBuffer,
-      useWorkerFetch: false,
-      isEvalSupported: false
-    });
-
-    const pdf = await loadingTask.promise;
-    const metadata = await pdf.getMetadata().catch(() => null);
-    const pages = [];
-
-    onProgress?.(`Reading 0 of ${pdf.numPages} pages...`);
-
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-      const page = await pdf.getPage(pageNumber);
-      const textContent = await page.getTextContent();
-      const pageText = extractPageText(textContent);
-      if (pageText) {
-        pages.push(pageText);
-      }
-
-      if (pageNumber === pdf.numPages || pageNumber % 20 === 0) {
-        onProgress?.(`Reading ${pageNumber} of ${pdf.numPages} pages...`);
-        await new Promise((resolve) => window.setTimeout(resolve, 0));
-      }
-    }
-
-    const content = normalizeText(pages.join("\n\n"));
-    if (!content) {
-      throw new Error("No readable text was found in this PDF.");
-    }
-
-    return {
-      title: derivePdfTitle(metadata, content, file.name),
-      content
-    };
-  }
-
-  async function handlePdfSelection(event) {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-
-    flushPendingSaves();
-    setIsImportingPdf(true);
-    setPdfImportStatus(`Importing ${file.name}...`);
-
-    try {
-      const importedBook = await extractPdfBook(file, (message) => {
-        setPdfImportStatus(`${file.name}: ${message}`);
-      });
-      const novel = createNovel(importedBook.title);
-      novel.title = importedBook.title;
-      novel.content = importedBook.content;
-      novel.updatedAt = Date.now();
-
-      const nextNovels = [...novels, novel];
-      await commitLibraryState(nextNovels, novel.id);
-      setTitleInput(novel.title);
-      setSearchQuery("");
-      previousRenderedNovelIdRef.current = null;
-      openNovel(novel.id, { skipFlush: true });
-      setPdfImportStatus(`Imported "${novel.title}".`);
-      queueAutoSync();
-    } catch (error) {
-      const message = error instanceof Error ? error.message : "PDF import failed.";
-      setPdfImportStatus(message);
-    } finally {
-      setIsImportingPdf(false);
-    }
   }
 
   function handleSaveNovel() {
@@ -1029,6 +819,7 @@ export default function App() {
       let nextActiveNovelId = activeNovelId;
 
       rows.forEach((row) => {
+        if (deletedNovelIdsRef.current.includes(row.id)) return;
         const remoteTime = Date.parse(row.client_updated_at || row.updated_at || 0);
         const local = byId.get(row.id);
         if (local && (local.updatedAt || 0) > remoteTime) return;
@@ -1169,24 +960,6 @@ export default function App() {
 
         <div className="library-actions">
           <input
-            ref={pdfInputRef}
-            type="file"
-            accept="application/pdf,.pdf"
-            className="file-input"
-            onChange={handlePdfSelection}
-          />
-          <button
-            className="import-card"
-            type="button"
-            onClick={() => pdfInputRef.current?.click()}
-            disabled={isImportingPdf || !isLibraryReady}
-          >
-            <span className="import-card-kicker">{isImportingPdf ? "Importing PDF" : "Attach PDF"}</span>
-            <span className="import-card-title">
-              {isImportingPdf ? "Reading pages and creating a new book..." : "Load a PDF as a saved book"}
-            </span>
-          </button>
-          <input
             className="input"
             type="text"
             placeholder="Novel title"
@@ -1199,11 +972,8 @@ export default function App() {
               New
             </button>
             <button className="action-button primary" type="button" onClick={handleSaveNovel}>
-              Save1
+              Save2
             </button>
-          </div>
-          <div className="import-status" aria-live="polite">
-            {pdfImportStatus}
           </div>
         </div>
 
@@ -1280,7 +1050,10 @@ export default function App() {
                 type="button"
                 className="rename-book-button"
                 aria-label={`Rename ${novel.title || "Untitled Novel"}`}
-                onClick={() => handleRenameNovel(novel.id)}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleRenameNovel(novel.id);
+                }}
               >
                 Edit
               </button>
@@ -1288,7 +1061,10 @@ export default function App() {
                 type="button"
                 className="delete-book-button"
                 aria-label={`Delete ${novel.title || "Untitled Novel"}`}
-                onClick={() => handleDeleteNovel(novel.id)}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  handleDeleteNovel(novel.id);
+                }}
               >
                 Delete
               </button>
