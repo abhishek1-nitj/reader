@@ -274,6 +274,17 @@ function getTextOffset(root, node, nodeOffset) {
   return range.toString().length;
 }
 
+function buildReaderHash(novelId) {
+  return `#reader=${encodeURIComponent(novelId)}`;
+}
+
+function getNovelIdFromHash() {
+  const hash = window.location.hash || "";
+  if (!hash.startsWith("#reader=")) return null;
+  const encodedNovelId = hash.slice("#reader=".length);
+  return encodedNovelId ? decodeURIComponent(encodedNovelId) : null;
+}
+
 export default function App() {
   const initialSettings = useMemo(() => loadAppSettings(), []);
   const [novels, setNovels] = useState([]);
@@ -302,6 +313,7 @@ export default function App() {
   const scrollTimerRef = useRef(null);
   const syncTimerRef = useRef(null);
   const importStatusTimerRef = useRef(null);
+  const routeInitializedRef = useRef(false);
   const syncInFlightRef = useRef(false);
   const syncingSuppressedRef = useRef(false);
   const deletedNovelIdsRef = useRef(Array.isArray(initialSettings.deletedNovelIds) ? initialSettings.deletedNovelIds : []);
@@ -463,7 +475,9 @@ export default function App() {
   useEffect(() => {
     if (!isLibraryReady) return;
     setViewMode("library");
-    window.history.replaceState({ viewMode: "library" }, "", window.location.href);
+    if (!getNovelIdFromHash()) {
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
     if (getSyncConfig().isConfigured) {
       void syncWithSupabase();
     }
@@ -472,22 +486,29 @@ export default function App() {
   useEffect(() => {
     if (!isLibraryReady) return undefined;
 
-    const handlePopState = (event) => {
-      const state = event.state;
-
-      if (state?.viewMode === "reader" && state.novelId) {
-        openNovel(state.novelId, { pushHistory: false });
+    const applyRoute = () => {
+      const novelId = getNovelIdFromHash();
+      if (novelId && novels.some((novel) => novel.id === novelId)) {
+        setActiveNovelId(novelId);
+        setViewMode("reader");
+        setShowChrome(false);
+        setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
       } else {
         flushPendingSaves();
         showLibraryView();
       }
     };
 
-    window.addEventListener("popstate", handlePopState);
+    if (!routeInitializedRef.current) {
+      routeInitializedRef.current = true;
+      applyRoute();
+    }
+
+    window.addEventListener("hashchange", applyRoute);
     return () => {
-      window.removeEventListener("popstate", handlePopState);
+      window.removeEventListener("hashchange", applyRoute);
     };
-  }, [isLibraryReady]);
+  }, [isLibraryReady, novels]);
 
   function getSettingsWithDeviceId() {
     const settings = loadAppSettings();
@@ -562,7 +583,7 @@ export default function App() {
   function commitLibraryState(nextNovels, nextActiveNovelId = activeNovelId) {
     setNovels(nextNovels);
     setActiveNovelId(nextActiveNovelId);
-    void persistLibrarySnapshot(nextNovels, nextActiveNovelId);
+    return persistLibrarySnapshot(nextNovels, nextActiveNovelId);
   }
 
   function getSelectionHighlightRange() {
@@ -667,7 +688,7 @@ export default function App() {
   function saveCurrentNovelFromReader() {
     if (!activeNovel || !readerRef.current) return;
     const snapshot = buildCurrentSnapshot();
-    commitLibraryState(snapshot.nextNovels, snapshot.nextActiveNovelId);
+    void commitLibraryState(snapshot.nextNovels, snapshot.nextActiveNovelId);
     queueAutoSync();
   }
 
@@ -706,15 +727,17 @@ export default function App() {
     setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
   }
 
-  function openNovel(id, { pushHistory = true } = {}) {
-    flushPendingSaves();
+  function openNovel(id, { updateHash = true, skipFlush = false } = {}) {
+    if (!skipFlush) {
+      flushPendingSaves();
+    }
     setActiveNovelId(id);
     setViewMode("reader");
     setShowChrome(false);
     setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
 
-    if (pushHistory) {
-      window.history.pushState({ viewMode: "reader", novelId: id }, "", window.location.href);
+    if (updateHash && window.location.hash !== buildReaderHash(id)) {
+      window.location.hash = buildReaderHash(id);
     }
   }
 
@@ -724,7 +747,7 @@ export default function App() {
 
   function handleBackToLibrary() {
     flushPendingSaves();
-    if (window.history.state?.viewMode === "reader") {
+    if (getNovelIdFromHash()) {
       window.history.back();
       return;
     }
@@ -764,6 +787,7 @@ export default function App() {
 
     if (activeNovelId === id) {
       showLibraryView();
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
       setTitleInput("");
       if (readerRef.current) {
         readerRef.current.innerHTML = "";
@@ -784,11 +808,16 @@ export default function App() {
     if (nextTitle == null) return;
 
     const trimmedTitle = nextTitle.trim() || "Untitled Novel";
-    updateNovelById(id, (novel) => ({
-      ...novel,
-      title: trimmedTitle,
-      updatedAt: Date.now()
-    }));
+    const nextNovels = novels.map((novel) =>
+      novel.id === id
+        ? {
+            ...novel,
+            title: trimmedTitle,
+            updatedAt: Date.now()
+          }
+        : novel
+    );
+    void commitLibraryState(nextNovels, activeNovelId);
 
     if (activeNovelId === id) {
       setTitleInput(trimmedTitle);
@@ -857,14 +886,11 @@ export default function App() {
       novel.updatedAt = Date.now();
 
       const nextNovels = [...novels, novel];
-      commitLibraryState(nextNovels, novel.id);
+      await commitLibraryState(nextNovels, novel.id);
       setTitleInput(novel.title);
       setSearchQuery("");
       previousRenderedNovelIdRef.current = null;
-      window.history.pushState({ viewMode: "reader", novelId: novel.id }, "", window.location.href);
-      setViewMode("reader");
-      setShowChrome(false);
-      setHighlightMenu({ visible: false, x: 0, y: 0, start: 0, end: 0, content: "" });
+      openNovel(novel.id, { skipFlush: true });
       setPdfImportStatus(`Imported "${novel.title}".`);
       queueAutoSync();
     } catch (error) {
@@ -882,29 +908,38 @@ export default function App() {
       novel.content = normalizeText(readerRef.current?.innerText || "");
       novel.fontSize = fontSize;
       novel.lineHeight = lineHeight;
-      setNovels((current) => [...current, novel]);
-      setActiveNovelId(novel.id);
+      void commitLibraryState([...novels, novel], novel.id);
       queueAutoSync();
       return;
     }
 
     saveCurrentNovelFromReader();
-    updateNovelById(activeNovel.id, (novel) => ({
-      ...novel,
-      title,
-      updatedAt: Date.now()
-    }));
+    const nextNovels = novels.map((novel) =>
+      novel.id === activeNovel.id
+        ? {
+            ...novel,
+            title,
+            updatedAt: Date.now()
+          }
+        : novel
+    );
+    void commitLibraryState(nextNovels, activeNovel.id);
     queueAutoSync();
   }
 
   function handleTitleChange(value) {
     setTitleInput(value);
     if (!activeNovel) return;
-    updateNovelById(activeNovel.id, (novel) => ({
-      ...novel,
-      title: (value || novel.title || "Untitled Novel").trim(),
-      updatedAt: Date.now()
-    }));
+    const nextNovels = novels.map((novel) =>
+      novel.id === activeNovel.id
+        ? {
+            ...novel,
+            title: (value || novel.title || "Untitled Novel").trim(),
+            updatedAt: Date.now()
+          }
+        : novel
+    );
+    void commitLibraryState(nextNovels, activeNovel.id);
     queueAutoSync();
   }
 
@@ -1164,7 +1199,7 @@ export default function App() {
               New
             </button>
             <button className="action-button primary" type="button" onClick={handleSaveNovel}>
-              Save
+              Save1
             </button>
           </div>
           <div className="import-status" aria-live="polite">
