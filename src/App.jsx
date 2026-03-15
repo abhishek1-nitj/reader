@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
 const STORAGE_KEY = "reader-library-v1";
+const SETTINGS_KEY = "reader-settings-v1";
 const DB_NAME = "reader-library-db";
 const STORE_NAME = "reader-library-store";
 const RECORD_KEY = "library-state";
@@ -78,6 +79,18 @@ function loadLegacyLibraryState() {
   }
 }
 
+function loadSettings() {
+  try {
+    return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+  } catch {
+    return {};
+  }
+}
+
+function saveSettings(settings) {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+}
+
 function clampFontSize(value) {
   if (Number.isNaN(value)) return 17;
   return Math.min(MAX_SIZE, Math.max(MIN_SIZE, value));
@@ -132,6 +145,7 @@ function getBookIdFromHash() {
 }
 
 export default function App() {
+  const initialSettings = useMemo(() => loadSettings(), []);
   const [books, setBooks] = useState([]);
   const [activeBookId, setActiveBookId] = useState(null);
   const [viewMode, setViewMode] = useState("library");
@@ -141,6 +155,9 @@ export default function App() {
   const [fontSize, setFontSize] = useState(17);
   const [lineHeight, setLineHeight] = useState(1.35);
   const [showChrome, setShowChrome] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [supabaseUrlInput, setSupabaseUrlInput] = useState(initialSettings.supabaseUrl || "");
+  const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(initialSettings.supabaseAnonKey || "");
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
   const [isReady, setIsReady] = useState(false);
 
@@ -202,6 +219,13 @@ export default function App() {
 
     void writeLibraryState({ books, activeBookId });
   }, [activeBookId, books, isReady]);
+
+  useEffect(() => {
+    saveSettings({
+      supabaseUrl: supabaseUrlInput.trim(),
+      supabaseAnonKey: supabaseAnonKeyInput.trim()
+    });
+  }, [supabaseAnonKeyInput, supabaseUrlInput]);
 
   useEffect(() => {
     if (!activeBook) return;
@@ -554,6 +578,10 @@ export default function App() {
         </div>
 
         <div className="library-list">
+          <button type="button" className="novel-card settings-card" onClick={() => setSettingsOpen(true)}>
+            <span className="novel-card-title">Settings</span>
+          </button>
+
           {sortedBooks.length === 0 ? <div className="empty-state">{isReady ? "" : "Loading books..."}</div> : null}
 
           {sortedBooks.map((book) => (
@@ -695,6 +723,48 @@ export default function App() {
           Page {pageMetrics.current} of {pageMetrics.total}
         </div>
       </main>
+
+      <div
+        className={`settings-overlay${settingsOpen ? " open" : ""}`}
+        aria-hidden={settingsOpen ? "false" : "true"}
+        onClick={(event) => {
+          if (event.target === event.currentTarget) {
+            setSettingsOpen(false);
+          }
+        }}
+      >
+        <div className="settings-panel" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+          <h2 id="settingsTitle">Settings</h2>
+          <div className="settings-grid">
+            <label className="settings-label">
+              <span>Supabase URL</span>
+              <input
+                className="input"
+                type="url"
+                placeholder="https://your-project.supabase.co"
+                value={supabaseUrlInput}
+                onChange={(event) => setSupabaseUrlInput(event.target.value)}
+              />
+            </label>
+            <label className="settings-label">
+              <span>Supabase Anon Key</span>
+              <input
+                className="input"
+                type="text"
+                placeholder="Paste anon key"
+                value={supabaseAnonKeyInput}
+                onChange={(event) => setSupabaseAnonKeyInput(event.target.value)}
+              />
+            </label>
+          </div>
+          <div className="settings-actions">
+            <button className="action-button" type="button" onClick={() => setSettingsOpen(false)}>
+              Close
+            </button>
+          </div>
+          <div className="settings-status">Saved locally on this device.</div>
+        </div>
+      </div>
     </div>
   );
 }
