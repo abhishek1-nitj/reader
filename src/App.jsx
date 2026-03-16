@@ -107,6 +107,8 @@ export default function App() {
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
   const [isReady, setIsReady] = useState(false);
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+  const [saveStatus, setSaveStatus] = useState(""); // "saving", "success", "error", or ""
+  const [saveMessage, setSaveMessage] = useState("");
 
   const readerRef = useRef(null);
   const saveTimerRef = useRef(null);
@@ -136,15 +138,22 @@ export default function App() {
     async function hydrate() {
       try {
         const config = getSyncConfig();
+        console.log("[HYDRATE] Starting app initialization...");
+        
         if (config.isConfigured) {
+          console.log("[HYDRATE] Supabase configured. Pulling data...");
           const remote = await pullFromSupabase(config);
           if (remote) {
             if (!cancelled) {
+              console.log(`[HYDRATE] Loaded ${remote.books?.length || 0} books from Supabase`);
               setBooks(Array.isArray(remote?.books) ? remote.books : []);
               setActiveBookId(typeof remote?.active_book_id === "string" ? remote.active_book_id : null);
             }
+          } else {
+            console.log("[HYDRATE] No data found on Supabase. Starting with empty library.");
           }
         } else {
+          console.log("[HYDRATE] Supabase not configured. Starting with empty library.");
           if (!cancelled) {
             setBooks([]);
             setActiveBookId(null);
@@ -152,12 +161,13 @@ export default function App() {
         }
       } catch (error) {
         if (!cancelled) {
-          console.error("Failed to hydrate from Supabase:", error);
+          console.error("[HYDRATE FAILED]", error);
           setBooks([]);
           setActiveBookId(null);
         }
       } finally {
         if (!cancelled) {
+          console.log("[HYDRATE] App is ready");
           setIsReady(true);
         }
       }
@@ -311,6 +321,8 @@ export default function App() {
     const content = normalizeText(readerRef.current.innerText || "");
     const now = Date.now();
 
+    console.log(`[SAVE] Content for "${activeBook.title}": ${content.length} characters`);
+
     return {
       nextBooks: books.map((book) =>
         book.id === activeBook.id
@@ -371,9 +383,35 @@ export default function App() {
       return;
     }
 
-    flushPendingSaves();
     if (viewMode === "reader") {
-      await syncWithSupabase({ manual: true });
+      const config = getSyncConfig();
+      if (!config.isConfigured) {
+        setSaveStatus("error");
+        setSaveMessage("❌ Supabase not configured. Set credentials in Settings.");
+        setTimeout(() => setSaveStatus(""), 4000);
+        return;
+      }
+
+      setSaveStatus("saving");
+      setSaveMessage("Saving...");
+
+      try {
+        flushPendingSaves();
+        await syncWithSupabase({ manual: true });
+        
+        setSaveStatus("success");
+        setSaveMessage("✓ Saved to Supabase!");
+        setHasUnsavedChanges(false);
+        
+        console.log("✓ Content saved successfully to Supabase");
+        setTimeout(() => setSaveStatus(""), 2000);
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : "Unknown error";
+        console.error("✗ Failed to save:", errorMsg);
+        setSaveStatus("error");
+        setSaveMessage(`❌ Failed to save: ${errorMsg}`);
+        setTimeout(() => setSaveStatus(""), 4000);
+      }
     }
   }
 
@@ -489,6 +527,8 @@ export default function App() {
 
   async function pullFromSupabase(config) {
     const url = `${config.supabaseUrl}/rest/v1/reader_libraries?id=eq.${encodeURIComponent(config.libraryId)}&select=*`;
+    console.log("[PULL] Fetching from Supabase...");
+    
     const response = await fetch(url, {
       method: "GET",
       headers: {
@@ -499,11 +539,14 @@ export default function App() {
 
     if (!response.ok) {
       const details = await response.text();
+      console.error(`[PULL FAILED] Status: ${response.status}, Details: ${details}`);
       throw new Error(`Fetch failed (${response.status})${details ? `: ${details}` : ""}`);
     }
 
     const rows = await response.json();
-    return Array.isArray(rows) ? rows[0] || null : null;
+    const result = Array.isArray(rows) ? rows[0] || null : null;
+    console.log("[PULL SUCCESS] Retrieved data from Supabase");
+    return result;
   }
 
   async function pushToSupabase(config, snapshot) {
@@ -512,6 +555,9 @@ export default function App() {
       books: snapshot.nextBooks,
       active_book_id: snapshot.nextActiveBookId
     };
+
+    console.log(`[PUSH] Pushing ${snapshot.nextBooks.length} books to Supabase...`);
+    console.log(`[PUSH] Supabase URL: ${config.supabaseUrl}`);
 
     const response = await fetch(`${config.supabaseUrl}/rest/v1/reader_libraries`, {
       method: "POST",
@@ -526,8 +572,11 @@ export default function App() {
 
     if (!response.ok) {
       const details = await response.text();
+      console.error(`[PUSH FAILED] Status: ${response.status}, Details: ${details}`);
       throw new Error(`Push failed (${response.status})${details ? `: ${details}` : ""}`);
     }
+
+    console.log("[PUSH SUCCESS] Data saved to Supabase!");
   }
 
   function applyRemoteLibrary(row) {
@@ -722,10 +771,18 @@ export default function App() {
               <button
                 className="action-button"
                 type="button"
-                disabled={!hasUnsavedChanges}
+                disabled={!hasUnsavedChanges || saveStatus === "saving"}
                 onClick={handleSave}
+                style={{
+                  opacity: saveStatus === "saving" ? 0.6 : 1,
+                  cursor: saveStatus === "saving" ? "wait" : "pointer",
+                  backgroundColor: 
+                    saveStatus === "success" ? "#10b981" :
+                    saveStatus === "error" ? "#ef4444" :
+                    "inherit"
+                }}
               >
-                Save
+                {saveStatus === "saving" ? "Saving..." : saveStatus === "success" ? "✓ Saved!" : "Save"}
               </button>
             </div>
             <div className="control-group" aria-label="Font size controls">
@@ -810,9 +867,38 @@ export default function App() {
         />
 
         <div className="page-counter" id="pageCounter">
-          Page {pageMetrics.current} of {pageMetrics.total}
+          <div>Page {pageMetrics.current} of {pageMetrics.total}</div>
+          {saveStatus && (
+            <div
+              className={`save-status save-status-${saveStatus}`}
+              style={{
+                marginTop: "8px",
+                padding: "8px 12px",
+                borderRadius: "4px",
+                fontSize: "12px",
+                fontWeight: "bold",
+                animation: saveStatus === "success" ? "saveSuccess 0.5s ease-in-out" : "none",
+                backgroundColor: 
+                  saveStatus === "saving" ? "#4a90e2" :
+                  saveStatus === "success" ? "#10b981" :
+                  saveStatus === "error" ? "#ef4444" :
+                  "transparent",
+                color: "white"
+              }}
+            >
+              {saveMessage}
+            </div>
+          )}
         </div>
       </main>
+
+      <style>{`
+        @keyframes saveSuccess {
+          0% { transform: scale(0.8); opacity: 0; }
+          50% { transform: scale(1.1); }
+          100% { transform: scale(1); opacity: 1; }
+        }
+      `}</style>
 
       <div
         className={`settings-overlay${settingsOpen ? " open" : ""}`}
