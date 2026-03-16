@@ -106,6 +106,7 @@ export default function App() {
   const [settingsStatus, setSettingsStatus] = useState(initialSettings.lastSyncMessage || "Supabase not connected.");
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
   const [isReady, setIsReady] = useState(false);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
 
   const readerRef = useRef(null);
   const saveTimerRef = useRef(null);
@@ -332,10 +333,12 @@ export default function App() {
     if (!activeBook) return;
     const snapshot = buildReaderSnapshot();
     commitLibrary(snapshot.nextBooks, snapshot.nextActiveBookId);
+    setHasUnsavedChanges(false);
   }
 
   function queueReaderSave() {
     clearTimers();
+    setHasUnsavedChanges(true);
     saveTimerRef.current = window.setTimeout(() => {
       const snapshot = buildReaderSnapshot();
       commitLibrary(snapshot.nextBooks, snapshot.nextActiveBookId);
@@ -362,13 +365,16 @@ export default function App() {
     setViewMode("library");
   }
 
-  function handleSave() {
+  async function handleSave() {
     if (viewMode === "library" && draftTitle.trim()) {
       handleCreateNew();
       return;
     }
 
     flushPendingSaves();
+    if (viewMode === "reader") {
+      await syncWithSupabase({ manual: true });
+    }
   }
 
   function openBook(bookId) {
@@ -553,14 +559,12 @@ export default function App() {
         }
       } else {
         await pushToSupabase(config, snapshot);
-        const remote = await pullFromSupabase(config);
-        if (remote) {
-          applyRemoteLibrary(remote);
-        }
+        // Do not immediately pull after push to avoid overwriting local changes.
       }
 
       const message = `Last synced ${new Date().toLocaleString()}`;
       setSettingsStatus(message);
+      setHasUnsavedChanges(false);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Sync failed";
       setSettingsStatus(message);
@@ -714,6 +718,14 @@ export default function App() {
             <div className="control-group" aria-label="Navigation controls">
               <button className="back-button" type="button" aria-label="Back to library" onClick={handleBackToLibrary}>
                 &#8592;
+              </button>
+              <button
+                className="action-button"
+                type="button"
+                disabled={!hasUnsavedChanges}
+                onClick={handleSave}
+              >
+                Save
               </button>
             </div>
             <div className="control-group" aria-label="Font size controls">
