@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
+const SETTINGS_KEY = "reader-settings-v1";
 const SUPABASE_LIBRARY_ID = "primary";
 const CHROME_REVEAL_HEIGHT = 90;
 const MIN_SIZE = 14;
@@ -8,6 +9,27 @@ const MIN_LINE_HEIGHT = 1;
 const MAX_LINE_HEIGHT = 2.4;
 const FONT_STEP = 1;
 const LINE_HEIGHT_STEP = 0.02;
+
+function loadSettings() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
+    return {
+      supabaseUrl: typeof parsed.supabaseUrl === "string" ? parsed.supabaseUrl : "",
+      supabaseAnonKey: typeof parsed.supabaseAnonKey === "string" ? parsed.supabaseAnonKey : "",
+      lastSyncMessage: typeof parsed.lastSyncMessage === "string" ? parsed.lastSyncMessage : "Supabase not connected."
+    };
+  } catch {
+    return {
+      supabaseUrl: "",
+      supabaseAnonKey: "",
+      lastSyncMessage: "Supabase not connected."
+    };
+  }
+}
+
+function saveSettings(settings) {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+}
 
 function clampFontSize(value) {
   if (Number.isNaN(value)) return 17;
@@ -63,6 +85,8 @@ function getBookIdFromHash() {
 }
 
 export default function App() {
+  const initialSettings = useMemo(() => loadSettings(), []);
+
   const [books, setBooks] = useState([]);
   const [activeBookId, setActiveBookId] = useState(null);
   const [viewMode, setViewMode] = useState("library");
@@ -73,9 +97,13 @@ export default function App() {
   const [lineHeight, setLineHeight] = useState(1.35);
   const [showChrome, setShowChrome] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [supabaseUrlInput, setSupabaseUrlInput] = useState(import.meta.env.VITE_SUPABASE_URL || "");
-  const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(import.meta.env.VITE_SUPABASE_ANON_KEY || "");
-  const [settingsStatus, setSettingsStatus] = useState("Supabase not connected.");
+  const [supabaseUrlInput, setSupabaseUrlInput] = useState(
+    initialSettings.supabaseUrl || import.meta.env.VITE_SUPABASE_URL || ""
+  );
+  const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(
+    initialSettings.supabaseAnonKey || import.meta.env.VITE_SUPABASE_ANON_KEY || ""
+  );
+  const [settingsStatus, setSettingsStatus] = useState(initialSettings.lastSyncMessage || "Supabase not connected.");
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
   const [isReady, setIsReady] = useState(false);
 
@@ -155,6 +183,14 @@ export default function App() {
     if (!getSyncConfig().isConfigured) return;
     void syncWithSupabase({ preferRemote: true });
   }, [isReady]);
+
+  useEffect(() => {
+    saveSettings({
+      supabaseUrl: supabaseUrlInput.trim(),
+      supabaseAnonKey: supabaseAnonKeyInput.trim(),
+      lastSyncMessage: settingsStatus
+    });
+  }, [settingsStatus, supabaseAnonKeyInput, supabaseUrlInput]);
 
   useEffect(() => {
     if (!activeBook) return;
