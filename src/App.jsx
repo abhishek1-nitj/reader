@@ -1,10 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
-const STORAGE_KEY = "reader-library-v1";
-const SETTINGS_KEY = "reader-settings-v1";
-const DB_NAME = "reader-library-db";
-const STORE_NAME = "reader-library-store";
-const RECORD_KEY = "library-state";
 const SUPABASE_LIBRARY_ID = "primary";
 const CHROME_REVEAL_HEIGHT = 90;
 const MIN_SIZE = 14;
@@ -13,84 +8,6 @@ const MIN_LINE_HEIGHT = 1;
 const MAX_LINE_HEIGHT = 2.4;
 const FONT_STEP = 1;
 const LINE_HEIGHT_STEP = 0.02;
-
-let databasePromise = null;
-
-function openDatabase() {
-  if (!databasePromise) {
-    databasePromise = new Promise((resolve, reject) => {
-      const request = window.indexedDB.open(DB_NAME, 1);
-
-      request.onupgradeneeded = () => {
-        const database = request.result;
-        if (!database.objectStoreNames.contains(STORE_NAME)) {
-          database.createObjectStore(STORE_NAME);
-        }
-      };
-
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error("Unable to open IndexedDB."));
-    });
-  }
-
-  return databasePromise;
-}
-
-async function readLibraryState() {
-  const database = await openDatabase();
-
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(STORE_NAME, "readonly");
-    const store = transaction.objectStore(STORE_NAME);
-    const request = store.get(RECORD_KEY);
-
-    request.onsuccess = () => {
-      const value = request.result;
-      resolve({
-        books: Array.isArray(value?.books) ? value.books : [],
-        activeBookId: typeof value?.activeBookId === "string" ? value.activeBookId : null
-      });
-    };
-    request.onerror = () => reject(request.error || new Error("Unable to read the saved library."));
-  });
-}
-
-async function writeLibraryState(nextState) {
-  const database = await openDatabase();
-
-  return new Promise((resolve, reject) => {
-    const transaction = database.transaction(STORE_NAME, "readwrite");
-    const store = transaction.objectStore(STORE_NAME);
-    store.put(nextState, RECORD_KEY);
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error || new Error("Unable to save the library."));
-    transaction.onabort = () => reject(transaction.error || new Error("Saving the library was aborted."));
-  });
-}
-
-function loadLegacyLibraryState() {
-  try {
-    const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
-    return {
-      books: Array.isArray(parsed.novels) ? parsed.novels : [],
-      activeBookId: typeof parsed.activeNovelId === "string" ? parsed.activeNovelId : null
-    };
-  } catch {
-    return { books: [], activeBookId: null };
-  }
-}
-
-function loadSettings() {
-  try {
-    return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}");
-  } catch {
-    return {};
-  }
-}
-
-function saveSettings(settings) {
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-}
 
 function clampFontSize(value) {
   if (Number.isNaN(value)) return 17;
@@ -146,7 +63,6 @@ function getBookIdFromHash() {
 }
 
 export default function App() {
-  const initialSettings = useMemo(() => loadSettings(), []);
   const [books, setBooks] = useState([]);
   const [activeBookId, setActiveBookId] = useState(null);
   const [viewMode, setViewMode] = useState("library");
@@ -157,9 +73,9 @@ export default function App() {
   const [lineHeight, setLineHeight] = useState(1.35);
   const [showChrome, setShowChrome] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [supabaseUrlInput, setSupabaseUrlInput] = useState(initialSettings.supabaseUrl || "");
-  const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(initialSettings.supabaseAnonKey || "");
-  const [settingsStatus, setSettingsStatus] = useState(initialSettings.lastSyncMessage || "Supabase not connected.");
+  const [supabaseUrlInput, setSupabaseUrlInput] = useState(import.meta.env.VITE_SUPABASE_URL || "");
+  const [supabaseAnonKeyInput, setSupabaseAnonKeyInput] = useState(import.meta.env.VITE_SUPABASE_ANON_KEY || "");
+  const [settingsStatus, setSettingsStatus] = useState("Supabase not connected.");
   const [pageMetrics, setPageMetrics] = useState({ current: 1, total: 1 });
   const [isReady, setIsReady] = useState(false);
 
@@ -190,18 +106,27 @@ export default function App() {
 
     async function hydrate() {
       try {
-        const indexed = await readLibraryState();
-        const legacy = loadLegacyLibraryState();
-        const nextState = indexed.books.length > 0 ? indexed : legacy;
-
-        if (indexed.books.length === 0 && legacy.books.length > 0) {
-          await writeLibraryState(nextState);
-          localStorage.removeItem(STORAGE_KEY);
+        const config = getSyncConfig();
+        if (config.isConfigured) {
+          const remote = await pullFromSupabase(config);
+          if (remote) {
+            if (!cancelled) {
+              setBooks(Array.isArray(remote?.books) ? remote.books : []);
+              setActiveBookId(typeof remote?.active_book_id === "string" ? remote.active_book_id : null);
+            }
+          }
+        } else {
+          if (!cancelled) {
+            setBooks([]);
+            setActiveBookId(null);
+          }
         }
-
-        if (cancelled) return;
-        setBooks(nextState.books);
-        setActiveBookId(nextState.activeBookId);
+      } catch (error) {
+        if (!cancelled) {
+          console.error("Failed to hydrate from Supabase:", error);
+          setBooks([]);
+          setActiveBookId(null);
+        }
       } finally {
         if (!cancelled) {
           setIsReady(true);
@@ -222,7 +147,7 @@ export default function App() {
     if (payload === lastPersistedRef.current) return;
     lastPersistedRef.current = payload;
 
-    void writeLibraryState({ books, activeBookId });
+    queueAutoSync();
   }, [activeBookId, books, isReady]);
 
   useEffect(() => {
@@ -230,14 +155,6 @@ export default function App() {
     if (!getSyncConfig().isConfigured) return;
     void syncWithSupabase({ preferRemote: true });
   }, [isReady]);
-
-  useEffect(() => {
-    saveSettings({
-      supabaseUrl: supabaseUrlInput.trim(),
-      supabaseAnonKey: supabaseAnonKeyInput.trim(),
-      lastSyncMessage: settingsStatus
-    });
-  }, [settingsStatus, supabaseAnonKeyInput, supabaseUrlInput]);
 
   useEffect(() => {
     if (!activeBook) return;
@@ -608,11 +525,6 @@ export default function App() {
 
       const message = `Last synced ${new Date().toLocaleString()}`;
       setSettingsStatus(message);
-      saveSettings({
-        supabaseUrl: config.supabaseUrl,
-        supabaseAnonKey: config.supabaseAnonKey,
-        lastSyncMessage: message
-      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Sync failed";
       setSettingsStatus(message);
